@@ -1,0 +1,10 @@
+{
+  "name": "ariadna-craft",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AriadnaCraft: Juego voxel estilo Minecraft 100% online, móvil táctil, WebXR y multiplayer con Cloudflare Durable Objects + Multi-IA",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  }
+}
