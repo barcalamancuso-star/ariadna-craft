@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="theme-color" content="#0b1120" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <title>AriadnaCraft Online — Voxel Multiplayer &amp; IA</title>
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" type="image/png" href="/icons/icon-192.png" />
@@ -30,23 +31,27 @@
     <header id="hud-top">
       <div class="hud-group">
         <button class="pill pill-brand" id="btn-room" title="Cambiar sala o nombre">
-          <span class="dot" id="ws-dot"></span>
+          <span class="dot connecting" id="ws-dot"></span>
           <span id="room-label">principal</span>
           <span id="online-count">1</span>
         </button>
-        <button class="pill" id="btn-invite" title="Copiar link multiplayer">🔗 Invitar</button>
+        <button class="pill" id="btn-invite" title="Copiar link multiplayer">🔗 <span class="lbl">Invitar</span></button>
         <button class="pill pill-ai" id="btn-ai" title="Constructor Ariadna IA (Tecla I)">✨ IA</button>
       </div>
       <div class="hud-group">
-        <button class="pill" id="btn-blocks" title="Todos los bloques (Tecla B)">🧱</button>
-        <button class="pill" id="btn-cam" title="1ª / 3ª Persona (Tecla V)">👁️ 1ª</button>
+        <button class="pill" id="btn-blocks" title="Catálogo de bloques (Tecla B)">🧱</button>
+        <button class="pill" id="btn-cam" title="1ª / 3ª Persona (Tecla V)">👁️ <span id="cam-label">1ª</span></button>
         <button class="pill" id="btn-fly" title="Volar (Tecla F)">🪽</button>
-        <button class="pill" id="btn-vr" title="Modo WebXR / VR">🥽 VR</button>
+        <button class="pill" id="btn-vr" title="Modo WebXR / VR">🥽 <span id="vr-label">VR</span></button>
         <button class="pill" id="btn-chat" title="Chat (Tecla T)">💬</button>
         <button class="pill" id="btn-audio" title="Sonido">🔊</button>
         <button class="pill" id="btn-help" title="Controles">❓</button>
       </div>
     </header>
+
+    <!-- Reconnect & WebXR status banners (tap to act / dismiss) -->
+    <button type="button" id="net-banner" class="status-banner hidden" aria-live="polite"></button>
+    <button type="button" id="xr-banner" class="status-banner xr-notice hidden" aria-live="polite"></button>
 
     <!-- Floating target info + mini feed -->
     <div id="target-badge" class="hidden"></div>
@@ -58,52 +63,61 @@
       <span>🖱️ Tocá la pantalla para mirar · <b>WASD</b> mover · <b>1-9 / Q-E</b> bloques · <b>J/K</b> o click romper/poner</span>
     </div>
 
-    <!-- Mobile Touch Overlay -->
+    <!-- Mobile Dual-Stick Touch Overlay -->
     <div id="touch-ui" class="hidden">
-      <div id="joy-zone">
+      <div id="joy-zone" aria-label="Joystick de movimiento">
         <div id="joy-base">
           <div id="joy-knob"></div>
         </div>
       </div>
-      <div id="look-zone"></div>
-      <div id="touch-actions">
-        <button class="act-btn act-fly" id="t-fly">🪽</button>
-        <button class="act-btn act-jump" id="t-jump">⬆️</button>
-        <button class="act-btn act-break" id="t-break">⛏️</button>
-        <button class="act-btn act-place" id="t-place">🧱</button>
+      <div id="look-zone" aria-label="Stick táctil para mirar">
+        <div id="look-ring" class="hidden">
+          <div id="look-dot"></div>
+        </div>
+      </div>
+      <div id="touch-actions" role="group" aria-label="Acciones táctiles">
+        <button type="button" class="act-btn act-fly" id="t-fly" title="Volar">🪽</button>
+        <button type="button" class="act-btn act-down hidden" id="t-down" title="Bajar (vuelo)">⬇️</button>
+        <button type="button" class="act-btn act-jump" id="t-jump" title="Saltar / Subir">⬆️</button>
+        <button type="button" class="act-btn act-break" id="t-break" title="Romper bloque">⛏️</button>
+        <button type="button" class="act-btn act-place" id="t-place" title="Colocar bloque">🧱</button>
       </div>
     </div>
 
-    <!-- Bottom Hotbar (9 slots, clickable + keys 1-9 + Q/E, no scroll wheel needed) -->
+    <!-- Bottom Hotbar (9 slots, clickable + keys 1-9 + Q/E + arrows, no scroll wheel needed) -->
     <nav id="hotbar-wrap" aria-label="Bloques rápidos">
-      <button class="hb-step" id="hb-prev" title="Bloque anterior (Q)">◀</button>
+      <button type="button" class="hb-step" id="hb-prev" title="Bloque anterior (Q)" aria-label="Bloque anterior">◀</button>
       <div id="hotbar"></div>
-      <button class="hb-step" id="hb-next" title="Siguiente bloque (E)">▶</button>
+      <button type="button" class="hb-step" id="hb-next" title="Siguiente bloque (E)" aria-label="Siguiente bloque">▶</button>
     </nav>
 
     <!-- Modal: Ariadna IA Constructor -->
-    <section class="modal hidden" id="modal-ai" role="dialog" aria-label="Ariadna IA">
+    <section class="modal hidden" id="modal-ai" role="dialog" aria-modal="true" aria-label="Ariadna IA">
       <div class="card">
         <div class="card-head">
-          <strong>✨ Ariadna Arquitecta IA</strong>
-          <button class="close-btn" data-close="modal-ai">✕</button>
+          <strong>✨ Ariadna Arquitecta Multi-IA</strong>
+          <button type="button" class="close-btn" data-close="modal-ai" aria-label="Cerrar">✕</button>
         </div>
-        <div class="chip-row">
-          <button class="chip" data-ai-prompt="construí una casa acogedora con ventanas y luz">🏠 Casa</button>
-          <button class="chip" data-ai-prompt="levantá una torre faro iluminada de 9 bloques">🗼 Torre</button>
-          <button class="chip" data-ai-prompt="armá un puente de madera con luces">🌉 Puente</button>
-          <button class="chip" data-ai-prompt="construí una pirámide de oro y diamante">🔺 Pirámide</button>
-          <button class="chip" data-ai-prompt="activá un portal de obsidiana y energía">💎 Portal</button>
-          <button class="chip" data-ai-prompt="plantá un árbol grande">🌳 Árbol</button>
+        <div class="chip-row" role="group" aria-label="Diseños rápidos">
+          <button type="button" class="chip" data-preset="casa" data-ai-prompt="construí una casa acogedora con ventanas y luz">🏠 Casa</button>
+          <button type="button" class="chip" data-preset="faro" data-ai-prompt="levantá una torre faro iluminada de 9 bloques">🗼 Torre/Faro</button>
+          <button type="button" class="chip" data-preset="puente" data-ai-prompt="armá un puente de madera con luces">🌉 Puente</button>
+          <button type="button" class="chip" data-preset="piramide" data-ai-prompt="construí una pirámide de oro y diamante">🔺 Pirámide</button>
+          <button type="button" class="chip" data-preset="portal" data-ai-prompt="activá un portal de obsidiana y energía">💎 Portal</button>
+          <button type="button" class="chip" data-preset="arbol" data-ai-prompt="plantá un árbol grande frondoso">🌳 Árbol</button>
+          <button type="button" class="chip" data-preset="castillo" data-ai-prompt="construí un castillo fortaleza medieval con almenas y torres">🏰 Castillo</button>
+          <button type="button" class="chip" data-preset="observatorio" data-ai-prompt="construí un observatorio astronómico con cúpula de cristal y luz">🔭 Observatorio</button>
+          <button type="button" class="chip" data-preset="fuente" data-ai-prompt="construí una fuente de plaza con agua cristalina y luz">⛲ Fuente</button>
         </div>
         <div class="row-inline">
           <select id="ai-provider" aria-label="Motor IA">
-            <option value="auto">Auto Multi-IA (Groq · Mistral · Gemini)</option>
-            <option value="groq">Groq (GPT-OSS-120B / Qwen 3.8)</option>
+            <option value="auto">Auto (Multi-IA: Gemini · Groq · Mistral)</option>
+            <option value="gemini">Google Gemini (3 cuentas: 4-Hydrogen / 3.8 / 3.5)</option>
+            <option value="groq">Groq (GPT-OSS 120B / Qwen3.8)</option>
             <option value="mistral">Mistral (Codestral)</option>
-            <option value="gemini">Google AI Studio (Gemini Free)</option>
           </select>
         </div>
+        <div id="ai-provider-hint" class="provider-hint">⚡ Auto: rota Gemini (3 cuentas) → Groq → Mistral con failover automático.</div>
         <form id="ai-form" class="row-inline">
           <input id="ai-input" type="text" maxlength="250" placeholder="Pedile qué construir o charlá..." autocomplete="off" />
           <button type="submit" class="btn-primary" id="ai-submit">Construir</button>
@@ -113,22 +127,22 @@
     </section>
 
     <!-- Modal: Catálogo de Bloques (sin scroll) -->
-    <section class="modal hidden" id="modal-blocks" role="dialog" aria-label="Bloques">
+    <section class="modal hidden" id="modal-blocks" role="dialog" aria-modal="true" aria-label="Bloques">
       <div class="card">
         <div class="card-head">
           <strong>🧱 Elegir Bloque (sin rueda de mouse)</strong>
-          <button class="close-btn" data-close="modal-blocks">✕</button>
+          <button type="button" class="close-btn" data-close="modal-blocks" aria-label="Cerrar">✕</button>
         </div>
         <div id="blocks-grid"></div>
       </div>
     </section>
 
     <!-- Modal: Sala / Jugador / Mundo -->
-    <section class="modal hidden" id="modal-room" role="dialog" aria-label="Sala Multiplayer">
+    <section class="modal hidden" id="modal-room" role="dialog" aria-modal="true" aria-label="Sala Multiplayer">
       <div class="card">
         <div class="card-head">
           <strong>🌐 Sala Multiplayer</strong>
-          <button class="close-btn" data-close="modal-room">✕</button>
+          <button type="button" class="close-btn" data-close="modal-room" aria-label="Cerrar">✕</button>
         </div>
         <form id="room-form" class="stack">
           <label class="field">
@@ -149,11 +163,11 @@
     </section>
 
     <!-- Modal: Chat rápido -->
-    <section class="modal hidden" id="modal-chat" role="dialog" aria-label="Chat">
+    <section class="modal hidden" id="modal-chat" role="dialog" aria-modal="true" aria-label="Chat">
       <div class="card">
         <div class="card-head">
           <strong>💬 Chat de Sala</strong>
-          <button class="close-btn" data-close="modal-chat">✕</button>
+          <button type="button" class="close-btn" data-close="modal-chat" aria-label="Cerrar">✕</button>
         </div>
         <form id="chat-form" class="row-inline">
           <input id="chat-input" type="text" maxlength="250" placeholder="Escribí un mensaje o /ia ..." autocomplete="off" />
@@ -163,17 +177,17 @@
     </section>
 
     <!-- Modal: Ayuda compacta (sin scroll) -->
-    <section class="modal hidden" id="modal-help" role="dialog" aria-label="Controles">
+    <section class="modal hidden" id="modal-help" role="dialog" aria-modal="true" aria-label="Controles">
       <div class="card">
         <div class="card-head">
           <strong>❓ Controles Rápidos</strong>
-          <button class="close-btn" data-close="modal-help">✕</button>
+          <button type="button" class="close-btn" data-close="modal-help" aria-label="Cerrar">✕</button>
         </div>
         <div class="help-grid">
-          <div><b>PC (sin rueda):</b><br/>WASD mover · Espacio saltar · Shift bajar · <b>1-9 / Q-E</b> bloques · <b>B</b> catálogo · <b>V</b> 1ª/3ª · <b>F</b> volar · <b>I</b> IA</div>
+          <div><b>PC (sin rueda):</b><br/>WASD mover · Espacio saltar · Shift bajar · <b>1-9 / Q-E / ◀▶</b> bloques · <b>B</b> catálogo · <b>V</b> 1ª/3ª · <b>F</b> volar · <b>I</b> IA</div>
           <div><b>Sin mouse / trackpad:</b><br/>Flechas mirar · <b>J</b> romper · <b>K</b> poner · Click en botones superiores</div>
-          <div><b>Celular / Tablet:</b><br/>Joystick izquierdo caminar · Deslizar derecha mirar · Botones ⛏️ romper / 🧱 poner / ⬆️ saltar</div>
-          <div><b>WebXR / VR:</b><br/>Tocá <b>🥽 VR</b> en visor compatible o activá modo estéreo 3D en celular</div>
+          <div><b>Celular / Tablet (Dual-Stick):</b><br/>Stick izq. caminar · Stick der. mirar · ⛏️ romper / 🧱 poner (mantener) · ⬆️ saltar · 🪽 volar</div>
+          <div><b>WebXR / VR:</b><br/>Tocá <b>🥽 VR</b> en visor compatible o activá modo estéreo 3D (Cardboard) en celular</div>
         </div>
       </div>
     </section>

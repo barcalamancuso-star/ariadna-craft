@@ -1,4 +1,4 @@
-const CACHE_NAME = "ariadna-craft-v1";
+const CACHE_NAME = "ariadna-craft-v2";
 const CORE_ASSETS = [
   "/",
   "/index.html",
@@ -9,8 +9,11 @@ const CORE_ASSETS = [
   "/shared/blocks.js",
   "/shared/raycast.js",
   "/shared/mesher.js",
+  "/shared/ai_blueprints.js",
   "/manifest.webmanifest",
-  "/icons/icon-192.png"
+  "/icons/icon-192.png",
+  "/icons/icon-512.png",
+  "/icons/apple-touch-icon.png",
 ];
 
 self.addEventListener("install", (event) => {

@@ -5,9 +5,31 @@ import {
   sanitizeBlueprint,
 } from "../public/shared/ai_blueprints.js";
 
+export const GROQ_MODELS = [
+  "openai/gpt-oss-120b",
+  "qwen/qwen3.8-27b",
+  "openai/gpt-oss-20b",
+];
+
+export const MISTRAL_MODELS = [
+  "codestral-latest",
+  "mistral-medium-latest",
+];
+
+export const GEMINI_MODELS = [
+  "gemini-4-hydrogen",
+  "gemini-3-flash-preview",
+  "gemini-3.5-flash-lite",
+  "gemma-4-26b-a4b-it",
+  "gemini-3.8-flash",
+  "gemini-2.5-flash",
+  "gemini-3.1-flash-lite-preview",
+  "gemini-flash-lite-latest",
+];
+
 function wantsConstruction(prompt) {
   const low = String(prompt || "").toLowerCase();
-  return /(constru|hac[eé]|cre[aá]|arm[aá]|edific|levant|diseñ|pon[eé]|casa|torre|puente|pir[aá]mide|castillo|portal|faro|cabañ|escalera|muro|pared|piso|tech|estatua|nave|[aá]rbol|bosque|fuente|piscina|pileta|templo|base|refugio|pixel|coraz[oó]n|arco)/.test(
+  return /(constru|hac[eé]|cre[aá]|arm[aá]|edific|levant|diseñ|pon[eé]|casa|torre|puente|pir[aá]mide|castillo|fortaleza|portal|faro|cabañ|escalera|muro|pared|piso|tech|estatua|nave|[aá]rbol|bosque|fuente|plaza|observatorio|c[uú]pula|domo|piscina|pileta|templo|base|refugio|pixel|coraz[oó]n|arco)/.test(
     low
   );
 }
@@ -64,7 +86,7 @@ async function callGemini(apiKey, model, userPrompt, fetchImpl = fetch) {
       contents: [{ role: "user", parts: [{ text: userPrompt }] }],
       generationConfig: {
         temperature: 0.35,
-        maxOutputTokens: 1400,
+        maxOutputTokens: 2400,
         responseMimeType: "application/json",
       },
     }),
@@ -79,38 +101,55 @@ async function callGemini(apiKey, model, userPrompt, fetchImpl = fetch) {
 
   const data = await res.json();
   const parts = data?.candidates?.[0]?.content?.parts || [];
-  return parts.map((p) => p.text || "").join("").trim();
+  const nonThoughtParts = parts.filter((p) => !p?.thought && typeof p?.text === "string");
+  const activeParts = nonThoughtParts.length > 0 ? nonThoughtParts : parts;
+  return activeParts.map((p) => p?.text || "").join("").trim();
 }
 
 export function buildProviderPlan(env, preferredProvider = "auto") {
   const candidates = [];
-  const pref = String(preferredProvider || "auto").toLowerCase();
+  const pref = String(preferredProvider || "auto").trim().toLowerCase();
 
   const addGroq = () => {
-    const keys = [env?.GROQ_API_KEY_1, env?.GROQ_API_KEY_2].filter(Boolean);
-    const models = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"];
-    for (const k of keys) {
-      for (const m of models) {
+    const keyEntries = [
+      { slot: 1, key: env?.GROQ_API_KEY_1 },
+      { slot: 2, key: env?.GROQ_API_KEY_2 },
+    ].filter((entry) => Boolean(entry.key));
+    if (keyEntries.length === 0) return;
+
+    for (let offset = 0; offset < keyEntries.length; offset++) {
+      for (let mIdx = 0; mIdx < GROQ_MODELS.length; mIdx++) {
+        const entry = keyEntries[(mIdx + offset) % keyEntries.length];
+        const model = GROQ_MODELS[mIdx];
         candidates.push({
           provider: "groq",
-          model: m,
+          model,
+          keySlot: entry.slot,
           run: (prompt, f) =>
-            callOpenAiCompatible("https://api.groq.com/openai/v1/chat/completions", k, m, prompt, f),
+            callOpenAiCompatible(
+              "https://api.groq.com/openai/v1/chat/completions",
+              entry.key,
+              model,
+              prompt,
+              f
+            ),
         });
       }
     }
   };
 
   const addMistral = () => {
-    if (env?.MISTRAL_API_KEY) {
+    if (!env?.MISTRAL_API_KEY) return;
+    for (const model of MISTRAL_MODELS) {
       candidates.push({
         provider: "mistral",
-        model: "codestral-latest",
+        model,
+        keySlot: 1,
         run: (prompt, f) =>
           callOpenAiCompatible(
             "https://api.mistral.ai/v1/chat/completions",
             env.MISTRAL_API_KEY,
-            "codestral-latest",
+            model,
             prompt,
             f
           ),
@@ -119,14 +158,22 @@ export function buildProviderPlan(env, preferredProvider = "auto") {
   };
 
   const addGemini = () => {
-    const keys = [env?.GEMINI_API_KEY_1, env?.GEMINI_API_KEY_2].filter(Boolean);
-    const models = ["gemini-flash-lite-latest", "gemini-3.1-flash-lite-preview", "gemini-3-flash-preview"];
-    for (const k of keys) {
-      for (const m of models) {
+    const keyEntries = [
+      { slot: 1, key: env?.GEMINI_API_KEY_1 },
+      { slot: 2, key: env?.GEMINI_API_KEY_2 },
+      { slot: 3, key: env?.GEMINI_API_KEY_3 },
+    ].filter((entry) => Boolean(entry.key));
+    if (keyEntries.length === 0) return;
+
+    for (let offset = 0; offset < keyEntries.length; offset++) {
+      for (let mIdx = 0; mIdx < GEMINI_MODELS.length; mIdx++) {
+        const entry = keyEntries[(mIdx + offset) % keyEntries.length];
+        const model = GEMINI_MODELS[mIdx];
         candidates.push({
           provider: "gemini",
-          model: m,
-          run: (prompt, f) => callGemini(k, m, prompt, f),
+          model,
+          keySlot: entry.slot,
+          run: (prompt, f) => callGemini(entry.key, model, prompt, f),
         });
       }
     }
@@ -140,8 +187,12 @@ export function buildProviderPlan(env, preferredProvider = "auto") {
     addGemini();
     addGroq();
     addMistral();
+  } else if (pref === "groq") {
+    addGroq();
+    addMistral();
+    addGemini();
   } else {
-    // Auto prioritizes ultra-fast Groq 120B/Qwen, then Mistral Codestral, then Gemini Free (2 accounts)
+    // Auto prioritizes ultra-fast Groq 120B/Qwen, then Mistral Codestral/Medium, then 3-account Gemini cascade
     addGroq();
     addMistral();
     addGemini();
@@ -168,7 +219,7 @@ export async function runAiArchitect({ env, prompt, anchor, playerName, preferre
   const plan = buildProviderPlan(env, preferredProvider);
   const errors = [];
 
-  for (const candidate of plan.slice(0, 7)) {
+  for (const candidate of plan.slice(0, 12)) {
     try {
       const raw = await candidate.run(userContext, fetchImpl);
       const parsed = extractJsonObject(raw);

@@ -7,7 +7,13 @@ import {
   resolveBlockId,
   sanitizeBlueprint,
 } from "../public/shared/ai_blueprints.js";
-import { runAiArchitect } from "../src/ai_router.js";
+import {
+  buildProviderPlan,
+  GEMINI_MODELS,
+  GROQ_MODELS,
+  MISTRAL_MODELS,
+  runAiArchitect,
+} from "../src/ai_router.js";
 import { RoomCore } from "../src/room_core.js";
 import { handleWorkerRequest, normalizeRoomName } from "../src/app.js";
 
@@ -246,6 +252,100 @@ test("runAiArchitect sends reasoning_effort=low only for openai/gpt-oss models",
   assert.equal(mistralCall.body.max_tokens, 2000);
 });
 
+test("buildProviderPlan rotates 3 Gemini accounts across all healthy models and handles 503/429 + thought parts", async () => {
+  const fullEnv = {
+    GEMINI_API_KEY_1: "gem_key_1",
+    GEMINI_API_KEY_2: "gem_key_2",
+    GEMINI_API_KEY_3: "gem_key_3",
+    GROQ_API_KEY_1: "groq_key_1",
+    GROQ_API_KEY_2: "groq_key_2",
+    MISTRAL_API_KEY: "mistral_key_1",
+  };
+
+  const geminiPlan = buildProviderPlan(fullEnv, "gemini");
+  assert.equal(geminiPlan[0].provider, "gemini");
+  assert.equal(geminiPlan[0].model, "gemini-4-hydrogen");
+  assert.equal(geminiPlan[0].keySlot, 1);
+  assert.equal(geminiPlan[1].keySlot, 2);
+  assert.equal(geminiPlan[2].keySlot, 3);
+
+  // All 8 models appear in the first 8 candidates with staggered key slots
+  const first8Models = geminiPlan.slice(0, 8).map((c) => c.model);
+  assert.deepEqual(first8Models, GEMINI_MODELS);
+  assert.ok(first8Models.includes("gemini-3.8-flash"));
+  assert.ok(first8Models.includes("gemini-2.5-flash"));
+  assert.ok(first8Models.includes("gemma-4-26b-a4b-it"));
+
+  const mistralPlan = buildProviderPlan(fullEnv, "mistral");
+  assert.deepEqual(
+    mistralPlan.slice(0, 2).map((c) => `${c.provider}:${c.model}`),
+    MISTRAL_MODELS.map((m) => `mistral:${m}`)
+  );
+
+  const groqPlan = buildProviderPlan(fullEnv, "groq");
+  assert.deepEqual(
+    groqPlan.slice(0, 3).map((c) => c.model),
+    GROQ_MODELS
+  );
+  assert.equal(groqPlan[0].keySlot, 1);
+  assert.equal(groqPlan[1].keySlot, 2);
+
+  // Simulate 503/429 on early Gemini models including gemini-3.8-flash, then succeed on gemma-4-26b-a4b-it with thought part
+  const triedUrls = [];
+  const mockGeminiFetch = async (url) => {
+    triedUrls.push(url);
+    if (
+      url.includes("gemini-4-hydrogen") ||
+      url.includes("gemini-3-flash-preview") ||
+      url.includes("gemini-3.5-flash-lite")
+    ) {
+      return new Response("overloaded", { status: 503 });
+    }
+    if (url.includes("gemma-4-26b-a4b-it")) {
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    thought: true,
+                    text: 'Thinking about {"reply":"wrong","blocks":[]} before final output',
+                  },
+                  {
+                    text: JSON.stringify({
+                      reply: "Observatorio listo",
+                      blocks: [{ dx: 0, dy: 0, dz: 0, t: "glass" }],
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+    }
+    return new Response("rate limit", { status: 429 });
+  };
+
+  const res = await runAiArchitect({
+    env: fullEnv,
+    prompt: "armá un observatorio",
+    anchor: { x: 32, y: 18, z: 32 },
+    preferredProvider: "gemini",
+    fetchImpl: mockGeminiFetch,
+  });
+
+  assert.equal(res.ok, true);
+  assert.equal(res.provider, "gemini");
+  assert.equal(res.model, "gemma-4-26b-a4b-it");
+  assert.equal(res.reply, "Observatorio listo");
+  assert.equal(res.blocks.length, 1);
+  assert.equal(res.blocks[0].t, BLOCK_IDS.GLASS);
+  assert.equal(triedUrls.length, 4);
+});
+
 const fakeUpgrade = (client) => ({ status: 101, webSocket: client });
 
 test("RoomCore handles multiplayer join, SQLite persistence across hibernation, block edits, and AI build", async () => {
@@ -315,6 +415,11 @@ test("handleWorkerRequest routes /api/health, /api/ai, and static assets safely"
 
   const env = {
     GROQ_API_KEY_1: "secret_never_leak",
+    GROQ_API_KEY_2: "secret_never_leak_2",
+    GEMINI_API_KEY_1: "secret_gem_1",
+    GEMINI_API_KEY_2: "secret_gem_2",
+    GEMINI_API_KEY_3: "secret_gem_3",
+    MISTRAL_API_KEY: "secret_mistral_1",
     WORLD_ROOM: {
       idFromName: (n) => n,
       get: () => ({
@@ -330,8 +435,15 @@ test("handleWorkerRequest routes /api/health, /api/ai, and static assets safely"
   assert.equal(health.status, 200);
   const healthJson = await health.json();
   assert.equal(healthJson.ok, true);
+  assert.equal(healthJson.geminiAccounts, 3);
+  assert.equal(healthJson.groqKeys, 2);
+  assert.equal(healthJson.mistral, true);
   assert.equal(healthJson.aiProviders.groq, true);
-  assert.equal(JSON.stringify(healthJson).includes("secret_never_leak"), false);
+  assert.equal(healthJson.aiProviders.groqKeys, 2);
+  assert.equal(healthJson.aiProviders.gemini, true);
+  assert.equal(healthJson.aiProviders.geminiAccounts, 3);
+  assert.equal(healthJson.aiProviders.mistral, true);
+  assert.equal(JSON.stringify(healthJson).includes("secret_"), false);
 
   const badAi = await handleWorkerRequest(
     new Request("https://app.test/api/ai", {

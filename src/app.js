@@ -23,15 +23,28 @@ export async function handleWorkerRequest(request, env, fetchImpl = fetch) {
   const url = new URL(request.url);
 
   if (url.pathname === "/api/health" && request.method === "GET") {
+    const geminiAccounts = [
+      env?.GEMINI_API_KEY_1,
+      env?.GEMINI_API_KEY_2,
+      env?.GEMINI_API_KEY_3,
+    ].filter(Boolean).length;
+    const groqKeys = [env?.GROQ_API_KEY_1, env?.GROQ_API_KEY_2].filter(Boolean).length;
+    const mistral = Boolean(env?.MISTRAL_API_KEY);
+
     return json({
       ok: true,
       service: "ariadna-craft",
       online: true,
-      durableObjects: Boolean(env.WORLD_ROOM),
+      durableObjects: Boolean(env?.WORLD_ROOM),
+      geminiAccounts,
+      groqKeys,
+      mistral,
       aiProviders: {
-        groq: Boolean(env.GROQ_API_KEY_1 || env.GROQ_API_KEY_2),
-        mistral: Boolean(env.MISTRAL_API_KEY),
-        gemini: Boolean(env.GEMINI_API_KEY_1 || env.GEMINI_API_KEY_2),
+        groq: groqKeys > 0,
+        groqKeys,
+        mistral,
+        gemini: geminiAccounts > 0,
+        geminiAccounts,
       },
     });
   }

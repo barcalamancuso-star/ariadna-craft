@@ -81,6 +81,19 @@ let reconnectAttempt = 0;
 let lastMoveSentAt = 0;
 let lastSentPose = "";
 const remotePlayers = new Map();
+const WS_BACKOFF_BASE_MS = 700;
+const WS_BACKOFF_MAX_MS = 15000;
+const WS_CONNECT_TIMEOUT_MS = 9000;
+const WS_PING_MS = 20000;
+const WS_STALE_MS = 55000;
+const MAX_PENDING_EDITS = 96;
+let wsGeneration = 0;
+let lastWsMessageAt = 0;
+let lastInitRoom = null;
+let reconnectCountdownTimer = null;
+let latencyMs = null;
+let offlineEditWarned = false;
+const pendingEdits = new Map(); // "x,y,z" -> {x,y,z,t} queued while offline
 
 // Input State
 const keys = new Set();
@@ -93,8 +106,14 @@ const touchState = {
   lookId: null,
   lookLastX: 0,
   lookLastY: 0,
+  lookStartX: 0,
+  lookStartY: 0,
   jumpHeld: false,
+  downHeld: false,
 };
+const tmpVecA = new THREE.Vector3();
+const tmpVecB = new THREE.Vector3();
+const tmpQuat = new THREE.Quaternion();
 
 // Three.js Setup
 const renderer = new THREE.WebGLRenderer({
@@ -290,14 +309,40 @@ function makeNameSprite(label, colorHex) {
   ctx.font = "bold 24px sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(String(label || "").slice(0, 16), 128, 32);
+  ctx.fillText(String(label || "").slice(0, 18), 128, 32);
 
   const tex = new THREE.CanvasTexture(c);
-  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true });
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
   const sprite = new THREE.Sprite(mat);
   sprite.scale.set(1.5, 0.38, 1);
   sprite.position.set(0, 2.15, 0);
+  sprite.renderOrder = 5;
+  sprite.userData.isNameTag = true;
   return sprite;
+}
+
+function disposeObject3D(obj) {
+  if (!obj) return;
+  obj.traverse((node) => {
+    node.geometry?.dispose?.();
+    const mats = Array.isArray(node.material) ? node.material : node.material ? [node.material] : [];
+    for (const m of mats) {
+      m.map?.dispose?.();
+      m.dispose?.();
+    }
+  });
+}
+
+function setAvatarNameTag(avatar, label, colorHex) {
+  const prev = avatar.userData.nameTag;
+  if (prev) {
+    avatar.remove(prev);
+    disposeObject3D(prev);
+  }
+  const tag = makeNameSprite(label, colorHex);
+  avatar.add(tag);
+  avatar.userData.nameTag = tag;
 }
 
 function createAvatar(name, colorHex, isAi = false) {
@@ -335,11 +380,10 @@ function createAvatar(name, colorHex, isAi = false) {
   headPivot.add(head, eyeL, eyeR);
 
   root.add(legL, legR, torso, armL, armR, headPivot);
+  root.userData = { legL, legR, armL, armR, headPivot, bodyMat, phase: 0, nameTag: null };
   if (name) {
-    root.add(makeNameSprite(name, colorHex));
+    setAvatarNameTag(root, name, colorHex);
   }
-
-  root.userData = { legL, legR, armL, armR, headPivot, bodyMat, phase: 0 };
   return root;
 }
 
@@ -461,18 +505,28 @@ document.querySelectorAll("[data-close]").forEach((btn) => {
 // Touch UI toggle
 function syncTouchVisibility() {
   touchUi.classList.toggle("hidden", !touchVisible);
+  document.body.classList.toggle("touch-mode", touchVisible);
   document.getElementById("t-fly").classList.toggle("active", flyMode);
+  document.getElementById("t-down").classList.toggle("hidden", !flyMode);
   document.getElementById("btn-fly").classList.toggle("active", flyMode);
+  pointerBanner.classList.toggle(
+    "hidden",
+    touchVisible || document.pointerLockElement === canvas
+  );
 }
 
 // Voxel Interaction (Break / Place)
-function getAimRay() {
+// raySource: optional XR controller Object3D (ray from controller instead of head)
+function getAimRay(raySource = null) {
   const origin = new THREE.Vector3();
   const dir = new THREE.Vector3(0, 0, -1);
-  if (renderer.xr.isPresenting) {
+  if (raySource && renderer.xr.isPresenting) {
+    raySource.getWorldPosition(origin);
+    dir.applyQuaternion(raySource.getWorldQuaternion(tmpQuat)).normalize();
+  } else if (renderer.xr.isPresenting) {
     const xrCam = renderer.xr.getCamera();
     xrCam.getWorldPosition(origin);
-    dir.applyQuaternion(xrCam.getWorldQuaternion(new THREE.Quaternion()));
+    dir.applyQuaternion(xrCam.getWorldQuaternion(tmpQuat)).normalize();
   } else if (thirdPerson) {
     origin.set(playerState.x, playerState.y + EYE_HEIGHT, playerState.z);
     const euler = new THREE.Euler(playerState.pitch, playerState.yaw, 0, "YXZ");
@@ -501,8 +555,8 @@ function overlapsPlayer(bx, by, bz) {
   );
 }
 
-function breakBlock() {
-  const { origin, dir } = getAimRay();
+function breakBlock(raySource = null) {
+  const { origin, dir } = getAimRay(raySource);
   const hit = raycastVoxels(worldData, origin, dir, 7.5);
   if (!hit) return;
   if (hit.y <= 0) {
@@ -511,11 +565,11 @@ function breakBlock() {
   }
   applyBlockLocal(hit.x, hit.y, hit.z, BLOCK_IDS.AIR);
   soundFX.playBreak();
-  sendWs({ type: "block", x: hit.x, y: hit.y, z: hit.z, t: BLOCK_IDS.AIR });
+  sendBlockEdit(hit.x, hit.y, hit.z, BLOCK_IDS.AIR);
 }
 
-function placeBlock() {
-  const { origin, dir } = getAimRay();
+function placeBlock(raySource = null) {
+  const { origin, dir } = getAimRay(raySource);
   const hit = raycastVoxels(worldData, origin, dir, 7.5);
   if (!hit) return;
   const tx = hit.x + hit.nx;
@@ -529,13 +583,56 @@ function placeBlock() {
   }
   applyBlockLocal(tx, ty, tz, blockId);
   soundFX.playPlace();
-  sendWs({ type: "block", x: tx, y: ty, z: tz, t: blockId });
+  sendBlockEdit(tx, ty, tz, blockId);
 }
 
-// Networking (WebSocket to Cloudflare Durable Object)
+// Networking (WebSocket to Cloudflare Durable Object) — hardened reconnect
+const netBanner = document.getElementById("net-banner");
+const roomBtn = document.getElementById("btn-room");
+
+function isWsOpen() {
+  return Boolean(ws && ws.readyState === WebSocket.OPEN);
+}
+
 function sendWs(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (!isWsOpen()) return false;
+  try {
     ws.send(JSON.stringify(obj));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sendBlockEdit(x, y, z, t) {
+  if (sendWs({ type: "block", x, y, z, t })) return;
+  // Offline: queue (last write per coordinate wins) and replay after re-sync
+  const key = `${x},${y},${z}`;
+  pendingEdits.delete(key);
+  pendingEdits.set(key, { x, y, z, t });
+  while (pendingEdits.size > MAX_PENDING_EDITS) {
+    pendingEdits.delete(pendingEdits.keys().next().value);
+  }
+  if (!offlineEditWarned) {
+    offlineEditWarned = true;
+    showToast("Sin conexión: tus cambios se enviarán al reconectar", 2600);
+  }
+}
+
+function setNetStatus(state, text = "") {
+  wsDot.classList.toggle("online", state === "online");
+  wsDot.classList.toggle("connecting", state === "connecting");
+  wsDot.classList.toggle("offline", state === "offline");
+  const ping = latencyMs !== null && state === "online" ? ` · ${latencyMs} ms` : "";
+  roomBtn.title = `Sala "${currentRoom}" · ${
+    state === "online" ? "conectado" : state === "connecting" ? "conectando…" : "desconectado"
+  }${ping} · tocá para cambiar sala o nombre`;
+  if (state === "online" || !text) {
+    netBanner.classList.add("hidden");
+  } else {
+    netBanner.textContent = text;
+    netBanner.classList.toggle("is-offline", state === "offline");
+    netBanner.classList.remove("hidden");
   }
 }
 
@@ -543,214 +640,454 @@ function updateOnlineBadge() {
   onlineCountEl.textContent = String(1 + remotePlayers.size);
 }
 
+function removeRemotePlayer(id) {
+  const rp = remotePlayers.get(id);
+  if (!rp) return;
+  scene.remove(rp.mesh);
+  disposeObject3D(rp.mesh);
+  remotePlayers.delete(id);
+  updateOnlineBadge();
+}
+
 function clearRemotePlayers() {
-  for (const rp of remotePlayers.values()) {
-    scene.remove(rp.mesh);
+  for (const id of [...remotePlayers.keys()]) {
+    removeRemotePlayer(id);
   }
   remotePlayers.clear();
   updateOnlineBadge();
 }
 
+function finiteOr(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function remoteLabel(p) {
+  const name = String(p?.name || "Jugador").slice(0, 16);
+  return p?.vr ? `🥽 ${name}` : name;
+}
+
 function upsertRemotePlayer(p) {
-  if (!p || !p.id || p.id === selfId) return;
-  let entry = remotePlayers.get(p.id);
-  if (!entry) {
-    const mesh = createAvatar(p.name, p.color, false);
-    mesh.position.set(p.x, p.y, p.z);
+  if (!p || p.id === undefined || p.id === null) return;
+  const id = String(p.id);
+  if (id === selfId) return;
+  const prev = remotePlayers.get(id);
+  const x = Math.max(0, Math.min(WORLD_SIZE_X, finiteOr(p.x, prev?.targetX ?? WORLD_SIZE_X / 2)));
+  const y = Math.max(-4, Math.min(WORLD_HEIGHT + 12, finiteOr(p.y, prev?.targetY ?? WORLD_HEIGHT / 2)));
+  const z = Math.max(0, Math.min(WORLD_SIZE_Z, finiteOr(p.z, prev?.targetZ ?? WORLD_SIZE_Z / 2)));
+  const yaw = finiteOr(p.yaw, prev?.targetYaw ?? 0);
+  const pitch = Math.max(-1.58, Math.min(1.58, finiteOr(p.pitch, prev?.targetPitch ?? 0)));
+  const color = typeof p.color === "string" && /^#[0-9a-f]{3,8}$/i.test(p.color) ? p.color : "#38bdf8";
+  const label = remoteLabel(p);
+  const now = performance.now();
+
+  if (!prev) {
+    const mesh = createAvatar(label, color, false);
+    mesh.position.set(x, y, z);
+    mesh.rotation.y = yaw;
     scene.add(mesh);
-    entry = {
+    remotePlayers.set(id, {
       mesh,
-      targetX: p.x,
-      targetY: p.y,
-      targetZ: p.z,
-      targetYaw: p.yaw || 0,
-      targetPitch: p.pitch || 0,
-      lastMoved: performance.now(),
-    };
-    remotePlayers.set(p.id, entry);
+      label,
+      color,
+      yaw,
+      pitch,
+      targetX: x,
+      targetY: y,
+      targetZ: z,
+      targetYaw: yaw,
+      targetPitch: pitch,
+      lastMoved: now,
+      lastSeen: now,
+    });
     updateOnlineBadge();
-  } else {
-    if (
-      Math.hypot(p.x - entry.targetX, p.z - entry.targetZ) > 0.02
-    ) {
-      entry.lastMoved = performance.now();
-    }
-    entry.targetX = p.x;
-    entry.targetY = p.y;
-    entry.targetZ = p.z;
-    entry.targetYaw = p.yaw || 0;
-    entry.targetPitch = p.pitch || 0;
+    return;
+  }
+
+  if (Math.hypot(x - prev.targetX, y - prev.targetY, z - prev.targetZ) > 0.02) {
+    prev.lastMoved = now;
+  }
+  // Teleports / respawns / world resets: snap instead of sliding through walls
+  if (Math.hypot(x - prev.mesh.position.x, y - prev.mesh.position.y, z - prev.mesh.position.z) > 12) {
+    prev.mesh.position.set(x, y, z);
+  }
+  prev.targetX = x;
+  prev.targetY = y;
+  prev.targetZ = z;
+  prev.targetYaw = yaw;
+  prev.targetPitch = pitch;
+  prev.lastSeen = now;
+  if (label !== prev.label || color !== prev.color) {
+    prev.label = label;
+    prev.color = color;
+    prev.mesh.userData.bodyMat.color.set(color);
+    setAvatarNameTag(prev.mesh, label, color);
   }
 }
 
-function connectSocket() {
+function applyBlocksBatch(blocks) {
+  const dirty = new Set();
+  for (const b of blocks) {
+    const bx = Math.floor(Number(b?.x));
+    const by = Math.floor(Number(b?.y));
+    const bz = Math.floor(Number(b?.z));
+    const bt = Math.floor(Number(b?.t));
+    if (!Number.isFinite(bt)) continue;
+    if (applyBlockLocal(bx, by, bz, bt, false)) {
+      markChunksAround(bx, bz, dirty);
+    }
+  }
+  for (const k of dirty) {
+    const [cx, cz] = k.split(",").map(Number);
+    rebuildChunk(cx, cz);
+  }
+}
+
+function respawnPlayer() {
+  const safe = getSpawnPoint(worldData);
+  playerState.x = safe.x;
+  playerState.y = safe.y;
+  playerState.z = safe.z;
+  playerState.vx = 0;
+  playerState.vy = 0;
+  playerState.vz = 0;
+}
+
+function handleInit(msg) {
+  selfId = msg.selfId != null ? String(msg.selfId) : null;
+  selfColor = msg.selfColor || "#38bdf8";
+  selfAvatar.userData.bodyMat.color.set(selfColor);
+
+  const prevSeed = worldSeed;
+  const nextSeed = Number.isFinite(Number(msg.seed)) && Number(msg.seed) > 0 ? Number(msg.seed) : worldSeed;
+  // Same room + same seed => this is a reconnect: keep the player where they were
+  const resume = lastInitRoom === currentRoom && nextSeed === prevSeed;
+  worldSeed = nextSeed;
+  worldData = generateBaseWorld(worldSeed);
+
+  if (Array.isArray(msg.edits)) {
+    for (const e of msg.edits) {
+      applyBlockLocal(Math.floor(e.x), Math.floor(e.y), Math.floor(e.z), Math.floor(e.t), false);
+    }
+  }
+
+  // Replay edits made while disconnected (only if the world is the same one)
+  const replay = resume ? [...pendingEdits.values()] : [];
+  pendingEdits.clear();
+  offlineEditWarned = false;
+  for (const e of replay) {
+    applyBlockLocal(e.x, e.y, e.z, e.t, false);
+  }
+  rebuildAllChunks();
+
+  if (!resume || collidesAt(playerState.x, playerState.y, playerState.z)) {
+    respawnPlayer();
+  }
+  lastInitRoom = currentRoom;
+
+  clearRemotePlayers();
+  if (Array.isArray(msg.players)) {
+    msg.players.forEach((p) => upsertRemotePlayer(p));
+  }
+
+  feedEl.innerHTML = "";
+  if (Array.isArray(msg.chat)) {
+    msg.chat.slice(-4).forEach((c) => addFeed(c.sender, c.text, c.kind));
+  }
+  updateOnlineBadge();
+
+  for (const e of replay) {
+    sendWs({ type: "block", x: e.x, y: e.y, z: e.z, t: e.t });
+  }
+  if (replay.length) {
+    showToast(`Sincronizados ${replay.length} cambios hechos sin conexión`, 2400);
+  }
+  // Announce our pose right away so others don't see us at the default spawn
+  lastSentPose = "";
+  lastMoveSentAt = 0;
+  // Healthy session: reset backoff only after a real init (not just TCP open)
+  reconnectAttempt = 0;
+}
+
+function handleServerMessage(raw) {
+  let msg;
+  try {
+    msg = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (!msg || typeof msg !== "object") return;
+
+  switch (msg.type) {
+    case "init":
+      handleInit(msg);
+      return;
+    case "pong": {
+      const t = Number(msg.t);
+      if (Number.isFinite(t) && t > 0) {
+        latencyMs = Math.max(0, Math.min(9999, Date.now() - t));
+        setNetStatus("online");
+      }
+      return;
+    }
+    case "player_join":
+      upsertRemotePlayer(msg.player);
+      addFeed("Sala", `${msg.player?.name || "Alguien"} entró al mundo`, "system");
+      return;
+    case "player_move":
+      upsertRemotePlayer(msg.player);
+      return;
+    case "player_leave": {
+      const rp = remotePlayers.get(String(msg.id));
+      if (rp) {
+        addFeed("Sala", `${rp.label.replace(/^🥽 /, "")} salió`, "system");
+        removeRemotePlayer(String(msg.id));
+      }
+      return;
+    }
+    case "block":
+      if (msg.by == null || String(msg.by) !== selfId) {
+        applyBlocksBatch([msg]);
+      }
+      return;
+    case "ai_build":
+      if (Array.isArray(msg.blocks)) applyBlocksBatch(msg.blocks);
+      if (msg.anchor) {
+        aiAvatar.position.set(
+          finiteOr(msg.anchor.x, 0) + 0.5,
+          finiteOr(msg.anchor.y, 1) + 1,
+          finiteOr(msg.anchor.z, 0) + 0.5
+        );
+        aiAvatar.visible = true;
+        aiAvatarHideAt = performance.now() + 14000;
+      }
+      if (msg.chat) addFeed(msg.chat.sender, msg.chat.text, "ai");
+      if (msg.provider !== "sync") soundFX.playAiBuild();
+      return;
+    case "chat":
+      addFeed(msg.sender, msg.text, msg.kind || "chat");
+      return;
+    case "world_reset":
+      worldSeed = Number(msg.seed) || 2026;
+      worldData = generateBaseWorld(worldSeed);
+      pendingEdits.clear();
+      rebuildAllChunks();
+      respawnPlayer();
+      if (msg.chat) addFeed(msg.chat.sender, msg.chat.text, "system");
+      showToast("Mundo regenerado!");
+      return;
+    case "error":
+      if (msg.message || msg.error) showToast(`⚠️ ${msg.message || msg.error}`, 2600);
+      return;
+    default:
+      return;
+  }
+}
+
+function stopReconnectTimers() {
   clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  clearInterval(reconnectCountdownTimer);
+  reconnectCountdownTimer = null;
+}
+
+function scheduleReconnect(gen, reason) {
+  if (gen !== wsGeneration || reconnectTimer) return;
+  ws = null;
+  clearInterval(reconnectCountdownTimer);
+  if (typeof navigator.onLine === "boolean" && !navigator.onLine) {
+    setNetStatus("offline", "📴 Sin internet · reconecto solo cuando vuelva la red");
+    return;
+  }
+  reconnectAttempt += 1;
+  const exp = Math.min(
+    WS_BACKOFF_MAX_MS,
+    WS_BACKOFF_BASE_MS * 2 ** Math.min(reconnectAttempt - 1, 6)
+  );
+  const delay = Math.round(exp * (0.75 + Math.random() * 0.5)); // ±25% jitter
+  const until = Date.now() + delay;
+  const tick = () => {
+    const s = Math.max(0, Math.ceil((until - Date.now()) / 1000));
+    setNetStatus(
+      "offline",
+      `⚠️ ${reason} · reintento #${reconnectAttempt} en ${s}s · tocá para reconectar ya`
+    );
+  };
+  tick();
+  reconnectCountdownTimer = setInterval(tick, 1000);
+  reconnectTimer = setTimeout(() => {
+    stopReconnectTimers();
+    connectSocket();
+  }, delay);
+}
+
+function connectSocket() {
+  stopReconnectTimers();
+  const gen = ++wsGeneration;
   if (ws) {
+    const old = ws;
+    ws = null;
     try {
-      ws.onclose = null;
-      ws.close();
+      old.close(1000, "reconnect");
     } catch {}
   }
 
   roomLabel.textContent = currentRoom;
-  wsDot.classList.remove("online");
+  setNetStatus(
+    "connecting",
+    reconnectAttempt > 0 ? `🔄 Reconectando a "${currentRoom}"… (intento #${reconnectAttempt + 1})` : ""
+  );
 
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const wsUrl = `${proto}//${location.host}/ws?room=${encodeURIComponent(
     currentRoom
   )}&name=${encodeURIComponent(playerName)}`;
 
-  ws = new WebSocket(wsUrl);
+  let sock;
+  try {
+    sock = new WebSocket(wsUrl);
+  } catch {
+    scheduleReconnect(gen, "No se pudo abrir la conexión");
+    return;
+  }
+  ws = sock;
 
-  ws.addEventListener("open", () => {
-    reconnectAttempt = 0;
-    wsDot.classList.add("online");
-    showToast(`Conectado a sala "${currentRoom}"`, 1800);
-  });
-
-  ws.addEventListener("message", (event) => {
-    let msg;
+  const connectTimeout = setTimeout(() => {
+    if (gen !== wsGeneration || sock.readyState !== WebSocket.CONNECTING) return;
     try {
-      msg = JSON.parse(event.data);
-    } catch {
-      return;
-    }
+      sock.close();
+    } catch {}
+    scheduleReconnect(gen, "Servidor sin respuesta");
+  }, WS_CONNECT_TIMEOUT_MS);
 
-    if (msg.type === "init") {
-      selfId = msg.selfId;
-      selfColor = msg.selfColor || "#38bdf8";
-      selfAvatar.userData.bodyMat.color.set(selfColor);
-
-      if (msg.seed && msg.seed !== worldSeed) {
-        worldSeed = msg.seed;
-        worldData = generateBaseWorld(worldSeed);
-      } else {
-        worldData = generateBaseWorld(worldSeed);
-      }
-
-      if (Array.isArray(msg.edits)) {
-        for (const e of msg.edits) {
-          applyBlockLocal(e.x, e.y, e.z, e.t, false);
-        }
-      }
-      rebuildAllChunks();
-
-      const safe = getSpawnPoint(worldData);
-      playerState.x = safe.x;
-      playerState.y = safe.y;
-      playerState.z = safe.z;
-      playerState.vx = 0;
-      playerState.vy = 0;
-      playerState.vz = 0;
-
-      clearRemotePlayers();
-      if (Array.isArray(msg.players)) {
-        msg.players.forEach((p) => upsertRemotePlayer(p));
-      }
-
-      feedEl.innerHTML = "";
-      if (Array.isArray(msg.chat)) {
-        msg.chat.slice(-4).forEach((c) => addFeed(c.sender, c.text, c.kind));
-      }
-      updateOnlineBadge();
-      return;
-    }
-
-    if (msg.type === "player_join") {
-      upsertRemotePlayer(msg.player);
-      addFeed("Sala", `${msg.player?.name || "Alguien"} entró al mundo`, "system");
-      return;
-    }
-
-    if (msg.type === "player_move") {
-      upsertRemotePlayer(msg.player);
-      return;
-    }
-
-    if (msg.type === "player_leave") {
-      const rp = remotePlayers.get(msg.id);
-      if (rp) {
-        scene.remove(rp.mesh);
-        remotePlayers.delete(msg.id);
-        updateOnlineBadge();
-      }
-      return;
-    }
-
-    if (msg.type === "block") {
-      if (msg.by !== selfId) {
-        applyBlockLocal(msg.x, msg.y, msg.z, msg.t, true);
-      }
-      return;
-    }
-
-    if (msg.type === "ai_build") {
-      const dirty = new Set();
-      if (Array.isArray(msg.blocks)) {
-        for (const b of msg.blocks) {
-          if (applyBlockLocal(b.x, b.y, b.z, b.t, false)) {
-            markChunksAround(b.x, b.z, dirty);
-          }
-        }
-      }
-      for (const k of dirty) {
-        const [cx, cz] = k.split(",").map(Number);
-        rebuildChunk(cx, cz);
-      }
-      if (msg.anchor) {
-        aiAvatar.position.set(msg.anchor.x + 0.5, msg.anchor.y + 1, msg.anchor.z + 0.5);
-        aiAvatar.visible = true;
-        aiAvatarHideAt = performance.now() + 14000;
-      }
-      if (msg.chat) {
-        addFeed(msg.chat.sender, msg.chat.text, "ai");
-      }
-      soundFX.playAiBuild();
-      return;
-    }
-
-    if (msg.type === "chat") {
-      addFeed(msg.sender, msg.text, msg.kind || "chat");
-      return;
-    }
-
-    if (msg.type === "world_reset") {
-      worldSeed = msg.seed || 2026;
-      worldData = generateBaseWorld(worldSeed);
-      rebuildAllChunks();
-      const safe = getSpawnPoint(worldData);
-      playerState.x = safe.x;
-      playerState.y = safe.y;
-      playerState.z = safe.z;
-      playerState.vy = 0;
-      if (msg.chat) addFeed(msg.chat.sender, msg.chat.text, "system");
-      showToast("Mundo regenerado!");
-    }
+  sock.addEventListener("open", () => {
+    clearTimeout(connectTimeout);
+    if (gen !== wsGeneration) return;
+    lastWsMessageAt = performance.now();
+    const wasReconnect = reconnectAttempt > 0;
+    setNetStatus("online");
+    showToast(
+      wasReconnect ? `✅ Reconectado a "${currentRoom}"` : `Conectado a sala "${currentRoom}"`,
+      1800
+    );
+    sendWs({ type: "ping", t: Date.now() });
   });
 
-  ws.addEventListener("close", () => {
-    wsDot.classList.remove("online");
-    reconnectAttempt += 1;
-    const waitMs = Math.min(5000, 900 * reconnectAttempt);
-    reconnectTimer = setTimeout(connectSocket, waitMs);
+  sock.addEventListener("message", (event) => {
+    if (gen !== wsGeneration) return;
+    lastWsMessageAt = performance.now();
+    handleServerMessage(event.data);
   });
 
-  ws.addEventListener("error", () => {
+  sock.addEventListener("close", (ev) => {
+    clearTimeout(connectTimeout);
+    if (gen !== wsGeneration) return;
+    const reason =
+      ev.code === 1008 || ev.code === 4003
+        ? "Conexión rechazada por el servidor"
+        : ev.code === 1013
+          ? "Sala ocupada"
+          : "Conexión perdida";
+    scheduleReconnect(gen, reason);
+  });
+
+  sock.addEventListener("error", () => {
+    if (gen !== wsGeneration) return;
     wsDot.classList.remove("online");
   });
 }
 
-setInterval(() => {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+function reconnectNow() {
+  if (isWsOpen()) return;
+  stopReconnectTimers();
+  connectSocket();
+}
+
+netBanner.addEventListener("click", reconnectNow);
+
+window.addEventListener("online", () => {
+  reconnectAttempt = 0;
+  reconnectNow();
+});
+
+window.addEventListener("offline", () => {
+  setNetStatus("offline", "📴 Sin internet · reconecto solo cuando vuelva la red");
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  const stale = performance.now() - lastWsMessageAt > WS_STALE_MS;
+  if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+    reconnectNow();
+  } else if (isWsOpen() && stale) {
     sendWs({ type: "ping", t: Date.now() });
   }
-}, 24000);
+});
+
+// Heartbeat + stale-connection watchdog (half-open sockets after sleep / network switch)
+setInterval(() => {
+  if (!isWsOpen()) return;
+  if (performance.now() - lastWsMessageAt > WS_STALE_MS) {
+    const gen = wsGeneration;
+    try {
+      ws.close(4000, "stale");
+    } catch {}
+    scheduleReconnect(gen, "Conexión congelada");
+    return;
+  }
+  sendWs({ type: "ping", t: Date.now() });
+}, WS_PING_MS);
 
 // AI Architect Action
-async function invokeAiArchitect(promptText) {
+const AI_PROVIDERS = ["auto", "gemini", "groq", "mistral"];
+const AI_PROVIDER_HINTS = {
+  auto: "⚡ Auto: rota Gemini (3 cuentas) → Groq → Mistral con failover automático ante 429/503.",
+  gemini: "🔷 Gemini 4-Hydrogen · 3.8 Flash · 3.5 Flash-Lite repartido en 3 cuentas Google AI Studio.",
+  groq: "🚀 Groq ultra-rápido: GPT-OSS 120B con respaldo Qwen3.8.",
+  mistral: "🧩 Mistral Codestral: JSON preciso para estructuras voxel.",
+};
+const AI_TIMEOUT_MS = 45000;
+const aiProviderSel = document.getElementById("ai-provider");
+const aiProviderHint = document.getElementById("ai-provider-hint");
+const aiModal = document.getElementById("modal-ai");
+let aiBusy = false;
+
+function syncAiProviderHint() {
+  if (aiProviderHint) {
+    aiProviderHint.textContent = AI_PROVIDER_HINTS[aiProviderSel.value] || AI_PROVIDER_HINTS.auto;
+  }
+}
+
+{
+  const saved = localStorage.getItem("ac_ai_provider");
+  if (saved && AI_PROVIDERS.includes(saved)) aiProviderSel.value = saved;
+  syncAiProviderHint();
+  aiProviderSel.addEventListener("change", () => {
+    if (AI_PROVIDERS.includes(aiProviderSel.value)) {
+      localStorage.setItem("ac_ai_provider", aiProviderSel.value);
+    }
+    syncAiProviderHint();
+  });
+}
+
+function setAiBusy(busy) {
+  aiBusy = busy;
+  aiModal.classList.toggle("busy", busy);
+  document.getElementById("ai-submit").disabled = busy;
+  document.querySelectorAll("[data-ai-prompt]").forEach((chip) => {
+    chip.disabled = busy;
+  });
+}
+
+async function invokeAiArchitect(promptText, preset = null) {
   const statusEl = document.getElementById("ai-status");
-  const submitBtn = document.getElementById("ai-submit");
-  const provider = document.getElementById("ai-provider").value;
+  const text = String(promptText || "").trim().slice(0, 250);
+  if (!text) return;
+  if (aiBusy) {
+    showToast("✨ La IA ya está construyendo… esperá un momento", 1800);
+    return;
+  }
+  const provider = AI_PROVIDERS.includes(aiProviderSel.value) ? aiProviderSel.value : "auto";
 
   const { origin, dir } = getAimRay();
   const hit = raycastVoxels(worldData, origin, dir, 12);
@@ -765,41 +1102,60 @@ async function invokeAiArchitect(promptText) {
     const fx = Math.round(playerState.x - Math.sin(playerState.yaw) * 4);
     const fz = Math.round(playerState.z - Math.cos(playerState.yaw) * 4);
     anchor = {
-      x: Math.max(4, Math.min(WORLD_SIZE_X - 5, fx)),
+      x: fx,
       y: Math.max(1, Math.round(playerState.y)),
-      z: Math.max(4, Math.min(WORLD_SIZE_Z - 5, fz)),
+      z: fz,
     };
   }
+  anchor.x = Math.max(4, Math.min(WORLD_SIZE_X - 5, anchor.x));
+  anchor.y = Math.max(1, Math.min(WORLD_HEIGHT - 2, anchor.y));
+  anchor.z = Math.max(4, Math.min(WORLD_SIZE_Z - 5, anchor.z));
 
-  statusEl.textContent = "Consultando red Multi-IA y construyendo...";
-  submitBtn.disabled = true;
+  const providerName = aiProviderSel.options[aiProviderSel.selectedIndex]?.text || provider;
+  statusEl.textContent = `Consultando ${providerName.split("(")[0].trim()} y construyendo...`;
+  setAiBusy(true);
+
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const abortTimer = controller ? setTimeout(() => controller.abort(), AI_TIMEOUT_MS) : null;
 
   try {
+    const body = { room: currentRoom, prompt: text, anchor, playerName, provider };
+    if (preset) body.preset = preset;
     const res = await fetch("/api/ai", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        room: currentRoom,
-        prompt: promptText,
-        anchor,
-        playerName,
-        provider,
-      }),
+      body: JSON.stringify(body),
+      signal: controller?.signal,
     });
-    const data = await res.json();
+    const raw = await res.text();
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      data = { ok: false, error: `Respuesta inválida del servidor (HTTP ${res.status}).` };
+    }
     if (!res.ok || !data.ok) {
-      statusEl.textContent = data.error || "Error al conectar con la IA.";
+      statusEl.textContent =
+        res.status === 429
+          ? "Demasiadas solicitudes a la IA. Esperá unos segundos y reintentá."
+          : data.error || `Error al conectar con la IA (HTTP ${res.status}).`;
       return;
     }
-    statusEl.textContent = `[${data.provider}/${data.model}] ${data.reply} (${data.blocksCount} bloques)`;
-    showToast(`✨ ${data.reply}`, 3200);
-    if (data.blocksCount > 0) {
+    const tag = [data.provider, data.model].filter(Boolean).join("/") || "ia";
+    const count = Number(data.blocksCount) || 0;
+    statusEl.textContent = `[${tag}] ${data.reply || "Listo"} (${count} bloques)`;
+    showToast(`✨ ${data.reply || "Construcción lista"}`, 3200);
+    if (count > 0) {
       setTimeout(closeAllModals, 700);
     }
-  } catch {
-    statusEl.textContent = "Sin conexión con el servidor IA.";
+  } catch (err) {
+    statusEl.textContent =
+      err?.name === "AbortError"
+        ? "La IA tardó demasiado (45 s). Probá otro motor o reintentá."
+        : "Sin conexión con el servidor IA.";
   } finally {
-    submitBtn.disabled = false;
+    clearTimeout(abortTimer);
+    setAiBusy(false);
   }
 }
 
@@ -812,25 +1168,40 @@ document.getElementById("btn-help").addEventListener("click", () => openModal("m
 document.getElementById("hb-prev").addEventListener("click", () => selectSlot(selectedSlot - 1));
 document.getElementById("hb-next").addEventListener("click", () => selectSlot(selectedSlot + 1));
 
+// Click on the dark backdrop closes a modal (no need to aim for the ✕)
+document.querySelectorAll(".modal").forEach((m) => {
+  m.addEventListener("click", (e) => {
+    if (e.target === m) closeAllModals();
+  });
+});
+
+const camBtnLabel = document.getElementById("cam-label");
 document.getElementById("btn-cam").addEventListener("click", () => {
   thirdPerson = !thirdPerson;
   selfAvatar.visible = thirdPerson;
-  document.getElementById("btn-cam").textContent = thirdPerson ? "👁️ 3ª" : "👁️ 1ª";
+  camBtnLabel.textContent = thirdPerson ? "3ª" : "1ª";
   showToast(thirdPerson ? "Cámara 3ª Persona" : "Cámara 1ª Persona", 1400);
 });
 
 const toggleFly = () => {
   flyMode = !flyMode;
   playerState.vy = 0;
+  touchState.downHeld = false;
   syncTouchVisibility();
-  showToast(flyMode ? "Modo Vuelo activado" : "Gravedad normal", 1400);
+  showToast(flyMode ? "Modo Vuelo activado (⬆️ subir · ⬇️ bajar)" : "Gravedad normal", 1400);
 };
 document.getElementById("btn-fly").addEventListener("click", toggleFly);
-document.getElementById("t-fly").addEventListener("click", toggleFly);
 
-document.getElementById("btn-audio").addEventListener("click", (e) => {
+const audioBtn = document.getElementById("btn-audio");
+function syncAudioBtn() {
+  audioBtn.textContent = soundFX.muted ? "🔇" : "🔊";
+}
+soundFX.muted = localStorage.getItem("ac_muted") === "1";
+syncAudioBtn();
+audioBtn.addEventListener("click", () => {
   soundFX.muted = !soundFX.muted;
-  e.currentTarget.textContent = soundFX.muted ? "🔇" : "🔊";
+  localStorage.setItem("ac_muted", soundFX.muted ? "1" : "0");
+  syncAudioBtn();
   if (!soundFX.muted) soundFX.playPlace();
 });
 
@@ -857,6 +1228,13 @@ document.getElementById("btn-invite").addEventListener("click", async () => {
 });
 
 document.getElementById("btn-reset-world").addEventListener("click", () => {
+  if (!isWsOpen()) {
+    showToast("Sin conexión: no se puede regenerar el mundo ahora");
+    return;
+  }
+  if (!window.confirm("¿Regenerar el mundo para TODOS en esta sala? Se borran las construcciones.")) {
+    return;
+  }
   sendWs({ type: "reset_world" });
   closeAllModals();
 });
@@ -871,6 +1249,7 @@ document.getElementById("room-form").addEventListener("submit", (e) => {
       .toLowerCase()
       .replace(/[^a-z0-9_-]/g, "")
       .slice(0, 28) || "principal";
+  if (nextRoom !== currentRoom) pendingEdits.clear();
   playerName = nextName;
   currentRoom = nextRoom;
   localStorage.setItem("ac_name", playerName);
@@ -879,20 +1258,22 @@ document.getElementById("room-form").addEventListener("submit", (e) => {
   nextUrl.searchParams.set("room", currentRoom);
   history.replaceState(null, "", nextUrl.toString());
   closeAllModals();
+  reconnectAttempt = 0;
   connectSocket();
 });
 
 document.getElementById("ai-form").addEventListener("submit", (e) => {
   e.preventDefault();
-  const val = document.getElementById("ai-input").value.trim();
-  if (!val) return;
-  document.getElementById("ai-input").value = "";
+  const input = document.getElementById("ai-input");
+  const val = input.value.trim();
+  if (!val || aiBusy) return;
+  input.value = "";
   invokeAiArchitect(val);
 });
 
 document.querySelectorAll("[data-ai-prompt]").forEach((chip) => {
   chip.addEventListener("click", () => {
-    invokeAiArchitect(chip.getAttribute("data-ai-prompt"));
+    invokeAiArchitect(chip.getAttribute("data-ai-prompt"), chip.getAttribute("data-preset"));
   });
 });
 
@@ -905,66 +1286,175 @@ document.getElementById("chat-form").addEventListener("submit", (e) => {
   closeAllModals();
   if (text.toLowerCase().startsWith("/ia ")) {
     invokeAiArchitect(text.slice(4));
-  } else {
-    sendWs({ type: "chat", text });
+  } else if (!sendWs({ type: "chat", text: text.slice(0, 250) })) {
+    showToast("Sin conexión: el mensaje no se envió");
   }
 });
 
-// WebXR + Stereo VR Mode
+// WebXR (immersive-vr) with safe activation + Cardboard stereo fallback
 let activeXrSession = null;
+let vrBusy = false;
+let stereoFullscreen = false;
+let xrSnapLatched = false;
 const vrBtn = document.getElementById("btn-vr");
+const vrLabel = document.getElementById("vr-label");
+const xrBanner = document.getElementById("xr-banner");
+let xrBannerTimer = null;
 
-async function toggleVrMode() {
-  if (activeXrSession) {
-    await activeXrSession.end();
-    return;
+function showXrBanner(text, ms = 6500) {
+  xrBanner.textContent = text;
+  xrBanner.classList.remove("hidden");
+  clearTimeout(xrBannerTimer);
+  xrBannerTimer = setTimeout(() => xrBanner.classList.add("hidden"), ms);
+}
+xrBanner.addEventListener("click", () => xrBanner.classList.add("hidden"));
+
+async function detectXrSupport() {
+  if (!window.isSecureContext) {
+    return { vr: false, reason: "WebXR requiere HTTPS" };
   }
+  if (!navigator.xr || typeof navigator.xr.isSessionSupported !== "function") {
+    return { vr: false, reason: "Este navegador no soporta WebXR" };
+  }
+  try {
+    const ok = await navigator.xr.isSessionSupported("immersive-vr");
+    return { vr: Boolean(ok), reason: ok ? "" : "No se detectó visor VR / runtime WebXR" };
+  } catch {
+    return { vr: false, reason: "WebXR bloqueado por el navegador o permisos" };
+  }
+}
 
-  if (navigator.xr && typeof navigator.xr.isSessionSupported === "function") {
+let xrSupport = { vr: false, reason: "Comprobando WebXR…" };
+async function refreshXrSupport() {
+  xrSupport = await detectXrSupport();
+  vrBtn.dataset.xr = xrSupport.vr ? "1" : "0";
+  vrBtn.title = xrSupport.vr
+    ? "Entrar a realidad virtual WebXR"
+    : `VR: ${xrSupport.reason} → modo estéreo 3D (Cardboard)`;
+  return xrSupport;
+}
+const xrSupportReady = refreshXrSupport();
+navigator.xr?.addEventListener?.("devicechange", () => {
+  refreshXrSupport();
+});
+
+function syncVrButton() {
+  const on = Boolean(activeXrSession) || stereoMode;
+  vrBtn.classList.toggle("active", on);
+  vrLabel.textContent = on ? "Salir" : "VR";
+}
+
+function enterStereo() {
+  stereoMode = true;
+  syncVrButton();
+  const fsReq = document.documentElement.requestFullscreen?.({ navigationUI: "hide" });
+  if (fsReq && typeof fsReq.then === "function") {
+    fsReq
+      .then(() => {
+        stereoFullscreen = true;
+        return screen.orientation?.lock?.("landscape");
+      })
+      .catch(() => {});
+  }
+  stereoEffect.setSize(window.innerWidth, window.innerHeight);
+  showToast("Modo Estéreo 3D (Cardboard) activo · 🥽 Salir para volver", 2600);
+}
+
+function exitStereo() {
+  stereoMode = false;
+  syncVrButton();
+  renderer.setScissorTest(false);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  try {
+    screen.orientation?.unlock?.();
+  } catch {}
+  if (stereoFullscreen && document.fullscreenElement) {
+    document.exitFullscreen?.().catch?.(() => {});
+  }
+  stereoFullscreen = false;
+  showToast("Modo Estéreo VR desactivado", 1600);
+}
+
+async function startXrSession() {
+  let session;
+  try {
+    session = await navigator.xr.requestSession("immersive-vr", {
+      optionalFeatures: ["local-floor", "bounded-floor", "hand-tracking"],
+    });
+  } catch (err) {
+    console.warn("[AriadnaCraft] requestSession falló:", err?.message || err);
+    return false;
+  }
+  // Use local-floor only if the runtime actually granted it, otherwise "local"
+  const floor = !Array.isArray(session.enabledFeatures) || session.enabledFeatures.includes("local-floor");
+  renderer.xr.setReferenceSpaceType(floor ? "local-floor" : "local");
+  try {
+    await renderer.xr.setSession(session);
+  } catch (err) {
+    console.warn("[AriadnaCraft] setSession falló:", err?.message || err);
     try {
-      const supported = await navigator.xr.isSessionSupported("immersive-vr");
-      if (supported) {
-        const session = await navigator.xr.requestSession("immersive-vr", {
-          optionalFeatures: ["local-floor", "bounded-floor", "hand-tracking"],
-        });
-        activeXrSession = session;
-        stereoMode = false;
-        vrBtn.classList.add("active");
-        session.addEventListener("end", () => {
-          activeXrSession = null;
-          vrBtn.classList.remove("active");
-          camera.position.set(0, 0, 0);
-        });
-        await renderer.xr.setSession(session);
-        showToast("Sesión WebXR activa");
-        return;
-      }
-    } catch {
-      // Fallback below
-    }
+      await session.end();
+    } catch {}
+    renderer.xr.setReferenceSpaceType("local-floor");
+    return false;
   }
 
-  // Cardboard Stereo 3D Fallback for mobile browsers without WebXR runtime
-  stereoMode = !stereoMode;
-  vrBtn.classList.toggle("active", stereoMode);
-  if (!stereoMode) {
+  activeXrSession = session;
+  if (stereoMode) {
+    stereoMode = false;
     renderer.setScissorTest(false);
+  }
+  // local-floor already includes the real head height; "local" starts at the head
+  yawPivot.position.y = floor ? 0 : EYE_HEIGHT;
+  syncVrButton();
+  session.addEventListener("end", () => {
+    activeXrSession = null;
+    yawPivot.position.y = EYE_HEIGHT;
+    camera.position.set(0, 0, 0);
+    renderer.xr.setReferenceSpaceType("local-floor");
     renderer.setSize(window.innerWidth, window.innerHeight);
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
-    showToast("Modo Estéreo VR desactivado");
-  } else {
-    try {
-      await document.documentElement.requestFullscreen?.();
-    } catch {}
-    stereoEffect.setSize(window.innerWidth, window.innerHeight);
-    showToast("Modo Estéreo 3D (Cardboard) activo");
+    syncVrButton();
+    showToast("Sesión WebXR finalizada", 1600);
+  });
+  showToast("Sesión WebXR activa · gatillo izq/der = poner/romper · stick der = girar", 3200);
+  return true;
+}
+
+async function toggleVrMode() {
+  if (vrBusy) return;
+  vrBusy = true;
+  try {
+    if (activeXrSession) {
+      await activeXrSession.end().catch(() => {});
+      return;
+    }
+    if (stereoMode) {
+      exitStereo();
+      return;
+    }
+    closeAllModals();
+    if (document.pointerLockElement === canvas) document.exitPointerLock?.();
+    await xrSupportReady;
+    if (xrSupport.vr) {
+      if (await startXrSession()) return;
+      showXrBanner("🥽 No se pudo iniciar WebXR en este dispositivo → usando modo estéreo 3D (Cardboard).");
+    } else {
+      showXrBanner(`🥽 ${xrSupport.reason}. Activé el modo estéreo 3D (Cardboard). Tocá 🥽 Salir para volver.`);
+    }
+    enterStereo();
+  } finally {
+    vrBusy = false;
   }
 }
 
 vrBtn.addEventListener("click", toggleVrMode);
 
-// WebXR Controllers
+// WebXR Controllers (attached to yawPivot so snap-turn rotates hands with the view)
 const controller0 = renderer.xr.getController(0);
 const controller1 = renderer.xr.getController(1);
 const rayLineGeom = new THREE.BufferGeometry().setFromPoints([
@@ -973,15 +1463,20 @@ const rayLineGeom = new THREE.BufferGeometry().setFromPoints([
 ]);
 controller0.add(new THREE.Line(rayLineGeom, new THREE.LineBasicMaterial({ color: 0x38bdf8 })));
 controller1.add(new THREE.Line(rayLineGeom, new THREE.LineBasicMaterial({ color: 0xf87171 })));
-controller0.addEventListener("selectstart", () => placeBlock());
-controller1.addEventListener("selectstart", () => breakBlock());
-playerRig.add(controller0, controller1);
+controller0.addEventListener("selectstart", () => placeBlock(controller0));
+controller1.addEventListener("selectstart", () => breakBlock(controller1));
+controller0.addEventListener("squeezestart", () => selectSlot(selectedSlot + 1));
+controller1.addEventListener("squeezestart", toggleFly);
+yawPivot.add(controller0, controller1);
 
 // Desktop Pointer Lock + Keyboard Controls (NO scroll wheel needed!)
 canvas.addEventListener("click", () => {
   soundFX.unlock();
   if (!anyModalOpen() && !touchVisible && document.pointerLockElement !== canvas) {
-    canvas.requestPointerLock?.();
+    try {
+      const req = canvas.requestPointerLock?.();
+      req?.catch?.(() => {});
+    } catch {}
   }
 });
 
@@ -1008,17 +1503,24 @@ document.addEventListener("mousemove", (e) => {
   );
 });
 
+const GAME_KEYS = new Set(["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Tab"]);
+
 window.addEventListener("keydown", (e) => {
   if (anyModalOpen()) {
     if (e.key === "Escape") closeAllModals();
     return;
   }
+  if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
 
   const code = e.code;
+  if (GAME_KEYS.has(code)) e.preventDefault();
   keys.add(code);
 
-  if (code >= "Digit1" && code <= "Digit9") {
+  if (code >= "Digit1" && code <= "Digit9" && code.length === 6) {
     selectSlot(Number(code.slice(5)) - 1);
+  } else if (code >= "Numpad1" && code <= "Numpad9" && code.length === 7) {
+    selectSlot(Number(code.slice(6)) - 1);
   } else if (code === "KeyQ") {
     selectSlot(selectedSlot - 1);
   } else if (code === "KeyE") {
@@ -1034,12 +1536,14 @@ window.addEventListener("keydown", (e) => {
     openModal("modal-chat");
   } else if (code === "KeyV") {
     document.getElementById("btn-cam").click();
-  } else if (code === "KeyF") {
+  } else if (code === "KeyF" && !e.repeat) {
     toggleFly();
   } else if (code === "KeyJ") {
     breakBlock();
   } else if (code === "KeyK") {
     placeBlock();
+  } else if (code === "Escape" && stereoMode) {
+    exitStereo();
   }
 });
 
@@ -1047,7 +1551,19 @@ window.addEventListener("keyup", (e) => {
   keys.delete(e.code);
 });
 
-// Mobile Touch Events (Multi-touch tracked by identifier)
+// Losing focus (alt-tab, notification, modal) must never leave keys "stuck"
+function releaseAllInputs() {
+  keys.clear();
+  touchState.jumpHeld = false;
+  touchState.downHeld = false;
+}
+window.addEventListener("blur", releaseAllInputs);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") releaseAllInputs();
+});
+
+// Mobile Touch Events (Multi-touch tracked by identifier) — dual stick:
+// left = floating move joystick, right = look stick (drag anywhere on the right half)
 window.addEventListener(
   "touchstart",
   () => {
@@ -1060,6 +1576,23 @@ window.addEventListener(
   { once: true, passive: true }
 );
 
+const JOY_MAX_R = 42;
+function updateJoyFromTouch(t) {
+  const dx = t.clientX - touchState.joyOriginX;
+  const dy = t.clientY - touchState.joyOriginY;
+  const dist = Math.hypot(dx, dy);
+  const clamped = dist > JOY_MAX_R ? JOY_MAX_R / dist : 1;
+  const nx = dx * clamped;
+  const ny = dy * clamped;
+  joyKnob.style.transform = `translate(${nx}px, ${ny}px)`;
+  // Small dead zone avoids drift when the thumb rests on the stick
+  const mx = nx / JOY_MAX_R;
+  const mz = ny / JOY_MAX_R;
+  const mag = Math.hypot(mx, mz);
+  touchState.moveX = mag < 0.12 ? 0 : mx;
+  touchState.moveZ = mag < 0.12 ? 0 : mz;
+}
+
 joyZone.addEventListener(
   "touchstart",
   (e) => {
@@ -1071,6 +1604,8 @@ joyZone.addEventListener(
       const rect = document.getElementById("joy-base").getBoundingClientRect();
       touchState.joyOriginX = rect.left + rect.width / 2;
       touchState.joyOriginY = rect.top + rect.height / 2;
+      joyZone.classList.add("engaged");
+      updateJoyFromTouch(t);
     }
   },
   { passive: false }
@@ -1082,18 +1617,7 @@ joyZone.addEventListener(
     if (touchState.joyId === null) return;
     e.preventDefault();
     for (const t of e.changedTouches) {
-      if (t.identifier === touchState.joyId) {
-        const dx = t.clientX - touchState.joyOriginX;
-        const dy = t.clientY - touchState.joyOriginY;
-        const maxR = 42;
-        const dist = Math.hypot(dx, dy);
-        const clamped = dist > maxR ? maxR / dist : 1;
-        const nx = dx * clamped;
-        const ny = dy * clamped;
-        joyKnob.style.transform = `translate(${nx}px, ${ny}px)`;
-        touchState.moveX = nx / maxR;
-        touchState.moveZ = ny / maxR;
-      }
+      if (t.identifier === touchState.joyId) updateJoyFromTouch(t);
     }
   },
   { passive: false }
@@ -1106,11 +1630,15 @@ const endJoy = (e) => {
       touchState.moveX = 0;
       touchState.moveZ = 0;
       joyKnob.style.transform = "translate(0px, 0px)";
+      joyZone.classList.remove("engaged");
     }
   }
 };
 joyZone.addEventListener("touchend", endJoy);
 joyZone.addEventListener("touchcancel", endJoy);
+
+const lookRing = document.getElementById("look-ring");
+const lookDot = document.getElementById("look-dot");
 
 lookZone.addEventListener(
   "touchstart",
@@ -1122,6 +1650,13 @@ lookZone.addEventListener(
       touchState.lookId = t.identifier;
       touchState.lookLastX = t.clientX;
       touchState.lookLastY = t.clientY;
+      touchState.lookStartX = t.clientX;
+      touchState.lookStartY = t.clientY;
+      const zr = lookZone.getBoundingClientRect();
+      lookRing.style.left = `${t.clientX - zr.left}px`;
+      lookRing.style.top = `${t.clientY - zr.top}px`;
+      lookDot.style.transform = "translate(-50%, -50%)";
+      lookRing.classList.remove("hidden");
     }
   },
   { passive: false }
@@ -1140,6 +1675,11 @@ lookZone.addEventListener(
         touchState.lookLastY = t.clientY;
         playerState.yaw -= dx * 0.0055;
         playerState.pitch = Math.max(-1.5, Math.min(1.5, playerState.pitch - dy * 0.005));
+        const ox = t.clientX - touchState.lookStartX;
+        const oy = t.clientY - touchState.lookStartY;
+        const od = Math.hypot(ox, oy);
+        const k = od > 34 ? 34 / od : 1;
+        lookDot.style.transform = `translate(calc(-50% + ${ox * k}px), calc(-50% + ${oy * k}px))`;
       }
     }
   },
@@ -1150,41 +1690,64 @@ const endLook = (e) => {
   for (const t of e.changedTouches) {
     if (t.identifier === touchState.lookId) {
       touchState.lookId = null;
+      lookRing.classList.add("hidden");
     }
   }
 };
 lookZone.addEventListener("touchend", endLook);
 lookZone.addEventListener("touchcancel", endLook);
 
-document.getElementById("t-break").addEventListener("click", (e) => {
-  e.preventDefault();
-  breakBlock();
-});
-document.getElementById("t-place").addEventListener("click", (e) => {
-  e.preventDefault();
-  placeBlock();
-});
-const jumpBtn = document.getElementById("t-jump");
-jumpBtn.addEventListener(
-  "touchstart",
-  (e) => {
+// Action buttons via Pointer Events (touch + mouse + pen), hold-to-repeat for break/place
+function bindHoldButton(el, { onDown, onUp, repeatMs = 0 }) {
+  let repeatTimer = null;
+  let activePointer = null;
+  const release = () => {
+    if (activePointer === null) return;
+    activePointer = null;
+    clearInterval(repeatTimer);
+    repeatTimer = null;
+    el.classList.remove("pressed");
+    onUp?.();
+  };
+  el.addEventListener("pointerdown", (e) => {
     e.preventDefault();
+    e.stopPropagation();
+    soundFX.unlock();
+    if (anyModalOpen() || activePointer !== null) return;
+    activePointer = e.pointerId;
+    el.classList.add("pressed");
+    try {
+      el.setPointerCapture(e.pointerId);
+    } catch {}
+    onDown();
+    if (repeatMs > 0) repeatTimer = setInterval(onDown, repeatMs);
+  });
+  el.addEventListener("pointerup", release);
+  el.addEventListener("pointercancel", release);
+  el.addEventListener("lostpointercapture", release);
+  el.addEventListener("contextmenu", (e) => e.preventDefault());
+  el.addEventListener("click", (e) => e.preventDefault());
+}
+
+bindHoldButton(document.getElementById("t-break"), { onDown: () => breakBlock(), repeatMs: 280 });
+bindHoldButton(document.getElementById("t-place"), { onDown: () => placeBlock(), repeatMs: 320 });
+bindHoldButton(document.getElementById("t-jump"), {
+  onDown: () => {
     touchState.jumpHeld = true;
   },
-  { passive: false }
-);
-jumpBtn.addEventListener("touchend", () => {
-  touchState.jumpHeld = false;
+  onUp: () => {
+    touchState.jumpHeld = false;
+  },
 });
-jumpBtn.addEventListener("touchcancel", () => {
-  touchState.jumpHeld = false;
+bindHoldButton(document.getElementById("t-down"), {
+  onDown: () => {
+    touchState.downHeld = true;
+  },
+  onUp: () => {
+    touchState.downHeld = false;
+  },
 });
-jumpBtn.addEventListener("mousedown", () => {
-  touchState.jumpHeld = true;
-});
-jumpBtn.addEventListener("mouseup", () => {
-  touchState.jumpHeld = false;
-});
+bindHoldButton(document.getElementById("t-fly"), { onDown: toggleFly });
 
 // Physics & Collision
 function collidesAt(px, py, pz) {
@@ -1235,13 +1798,36 @@ function stepPhysics(dt) {
   forward -= touchState.moveZ;
   strafe += touchState.moveX;
 
-  // WebXR thumbstick locomotion
+  // WebXR thumbsticks: left = move (relative to head), right X = snap turn,
+  // right Y = fly up/down, right A/X button = jump
+  let moveYaw = playerState.yaw;
+  let xrJump = false;
+  let xrVertical = 0;
   if (renderer.xr.isPresenting && activeXrSession?.inputSources) {
-    for (const src of activeXrSession.inputSources) {
+    renderer.xr.getCamera().getWorldDirection(tmpVecA);
+    if (Math.hypot(tmpVecA.x, tmpVecA.z) > 0.05) {
+      moveYaw = Math.atan2(-tmpVecA.x, -tmpVecA.z);
+    }
+    const sources = [...activeXrSession.inputSources];
+    const hasHanded = sources.some((s) => s.handedness === "left" || s.handedness === "right");
+    for (const src of sources) {
       const gp = src.gamepad;
-      if (gp && gp.axes.length >= 4) {
-        if (Math.abs(gp.axes[2]) > 0.15) strafe += gp.axes[2];
-        if (Math.abs(gp.axes[3]) > 0.15) forward -= gp.axes[3];
+      if (!gp || gp.axes.length < 4) continue;
+      const ax = gp.axes[2];
+      const ay = gp.axes[3];
+      if (src.handedness === "right" && hasHanded) {
+        if (Math.abs(ax) > 0.7 && !xrSnapLatched) {
+          playerState.yaw -= Math.sign(ax) * (Math.PI / 6);
+          xrSnapLatched = true;
+        } else if (Math.abs(ax) < 0.3) {
+          xrSnapLatched = false;
+        }
+        if (Math.abs(ay) > 0.35) xrVertical = -ay;
+        if (gp.buttons[4]?.pressed) xrJump = true;
+      } else {
+        if (Math.abs(ax) > 0.15) strafe += ax;
+        if (Math.abs(ay) > 0.15) forward -= ay;
+        if (gp.buttons[4]?.pressed) xrJump = true;
       }
     }
   }
@@ -1255,18 +1841,21 @@ function stepPhysics(dt) {
   const sprint = keys.has("ShiftLeft") && !flyMode ? 1.45 : 1.0;
   const speed = (flyMode ? 9.5 : 5.4) * sprint;
 
-  const sinY = Math.sin(playerState.yaw);
-  const cosY = Math.cos(playerState.yaw);
+  const sinY = Math.sin(moveYaw);
+  const cosY = Math.cos(moveYaw);
   const vx = (-sinY * forward + cosY * strafe) * speed;
   const vz = (-cosY * forward - sinY * strafe) * speed;
 
-  const jumpPressed = keys.has("Space") || touchState.jumpHeld;
+  const jumpPressed = keys.has("Space") || touchState.jumpHeld || xrJump;
   const inWater = inWaterAt(playerState.x, playerState.y, playerState.z);
 
   if (flyMode) {
     let vy = 0;
     if (jumpPressed) vy += 6.5;
-    if (keys.has("ShiftLeft") || keys.has("ShiftRight") || keys.has("KeyC")) vy -= 6.5;
+    if (keys.has("ShiftLeft") || keys.has("ShiftRight") || keys.has("KeyC") || touchState.downHeld) {
+      vy -= 6.5;
+    }
+    vy += xrVertical * 6.5;
     playerState.vy = vy;
   } else if (inWater) {
     playerState.vy = jumpPressed ? 3.8 : Math.max(-2.2, playerState.vy - 9.0 * dt);
@@ -1312,7 +1901,8 @@ function stepPhysics(dt) {
   playerRig.position.set(playerState.x, playerState.y, playerState.z);
 
   if (renderer.xr.isPresenting) {
-    yawPivot.rotation.y = 0;
+    // Keep rig yaw so thumbstick snap-turn works; the headset drives the camera pose
+    yawPivot.rotation.y = playerState.yaw;
     camera.rotation.set(0, 0, 0);
     camera.position.set(0, 0, 0);
     selfAvatar.visible = false;
@@ -1360,32 +1950,57 @@ function stepPhysics(dt) {
   }
 }
 
+function shortestAngle(from, to) {
+  let d = (to - from) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+function scaleNameTag(avatar, camPos) {
+  const tag = avatar.userData.nameTag;
+  if (!tag) return;
+  // Keep nametags readable at distance without becoming huge up close
+  const dist = avatar.position.distanceTo(camPos);
+  const s = Math.max(1, Math.min(2.6, dist / 9));
+  tag.scale.set(1.5 * s, 0.38 * s, 1);
+  tag.position.y = 2.15 + (s - 1) * 0.18;
+}
+
 function updateRemoteAvatars(dt, now) {
+  camera.getWorldPosition(tmpVecB);
+  // Frame-rate independent exponential smoothing (~90 ms time constant)
+  const k = 1 - Math.exp(-dt * 11);
   for (const rp of remotePlayers.values()) {
-    const k = Math.min(1, dt * 12);
-    rp.mesh.position.x += (rp.targetX - rp.mesh.position.x) * k;
-    rp.mesh.position.y += (rp.targetY - rp.mesh.position.y) * k;
-    rp.mesh.position.z += (rp.targetZ - rp.mesh.position.z) * k;
-    rp.mesh.rotation.y = rp.targetYaw;
-    rp.mesh.userData.headPivot.rotation.x = rp.targetPitch * 0.6;
-    const isMoving = now - rp.lastMoved < 180;
+    const m = rp.mesh;
+    m.position.x += (rp.targetX - m.position.x) * k;
+    m.position.y += (rp.targetY - m.position.y) * k;
+    m.position.z += (rp.targetZ - m.position.z) * k;
+    rp.yaw += shortestAngle(rp.yaw, rp.targetYaw) * k;
+    rp.pitch += (rp.targetPitch - rp.pitch) * k;
+    m.rotation.y = rp.yaw;
+    m.userData.headPivot.rotation.x = rp.pitch * 0.6;
+    const isMoving = now - rp.lastMoved < 220;
     if (isMoving) {
-      rp.mesh.userData.phase += dt * 9;
-      const s = Math.sin(rp.mesh.userData.phase) * 0.55;
-      rp.mesh.userData.legL.rotation.x = s;
-      rp.mesh.userData.legR.rotation.x = -s;
-      rp.mesh.userData.armL.rotation.x = -s * 0.8;
-      rp.mesh.userData.armR.rotation.x = s * 0.8;
+      m.userData.phase += dt * 9;
+      const s = Math.sin(m.userData.phase) * 0.55;
+      m.userData.legL.rotation.x = s;
+      m.userData.legR.rotation.x = -s;
+      m.userData.armL.rotation.x = -s * 0.8;
+      m.userData.armR.rotation.x = s * 0.8;
     } else {
-      rp.mesh.userData.legL.rotation.x = 0;
-      rp.mesh.userData.legR.rotation.x = 0;
-      rp.mesh.userData.armL.rotation.x = 0;
-      rp.mesh.userData.armR.rotation.x = 0;
+      const damp = 1 - k;
+      m.userData.legL.rotation.x *= damp;
+      m.userData.legR.rotation.x *= damp;
+      m.userData.armL.rotation.x *= damp;
+      m.userData.armR.rotation.x *= damp;
     }
+    scaleNameTag(m, tmpVecB);
   }
 
   if (aiAvatar.visible) {
     aiAvatar.rotation.y += dt * 1.6;
+    scaleNameTag(aiAvatar, tmpVecB);
     if (now > aiAvatarHideAt) {
       aiAvatar.visible = false;
     }
@@ -1407,10 +2022,18 @@ function updateTargetHighlight() {
 }
 
 function syncPoseIfNeeded(now) {
-  if (now - lastMoveSentAt < 80) return;
+  if (now - lastMoveSentAt < 80 || !isWsOpen()) return;
+  let yaw = playerState.yaw;
+  let pitch = playerState.pitch;
+  if (renderer.xr.isPresenting) {
+    // Broadcast where the headset is actually looking
+    renderer.xr.getCamera().getWorldDirection(tmpVecA);
+    yaw = Math.atan2(-tmpVecA.x, -tmpVecA.z);
+    pitch = Math.asin(Math.max(-1, Math.min(1, tmpVecA.y)));
+  }
   const pose = `${playerState.x.toFixed(2)},${playerState.y.toFixed(2)},${playerState.z.toFixed(
     2
-  )},${playerState.yaw.toFixed(2)},${playerState.pitch.toFixed(2)},${hotbar[selectedSlot]}`;
+  )},${yaw.toFixed(2)},${pitch.toFixed(2)},${hotbar[selectedSlot]},${Boolean(activeXrSession)}`;
   if (pose === lastSentPose) return;
   lastSentPose = pose;
   lastMoveSentAt = now;
@@ -1419,15 +2042,16 @@ function syncPoseIfNeeded(now) {
     x: Number(playerState.x.toFixed(2)),
     y: Number(playerState.y.toFixed(2)),
     z: Number(playerState.z.toFixed(2)),
-    yaw: Number(playerState.yaw.toFixed(3)),
-    pitch: Number(playerState.pitch.toFixed(3)),
+    yaw: Number(yaw.toFixed(3)),
+    pitch: Number(pitch.toFixed(3)),
     held: hotbar[selectedSlot],
     vr: Boolean(activeXrSession),
   });
 }
 
 // Resize handler
-window.addEventListener("resize", () => {
+function handleResize() {
+  if (renderer.xr.isPresenting) return; // XR owns the framebuffer size
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   if (stereoMode) {
@@ -1435,6 +2059,13 @@ window.addEventListener("resize", () => {
   } else {
     renderer.setSize(window.innerWidth, window.innerHeight);
   }
+}
+window.addEventListener("resize", handleResize);
+window.visualViewport?.addEventListener("resize", handleResize);
+window.addEventListener("orientationchange", () => setTimeout(handleResize, 250));
+document.addEventListener("fullscreenchange", () => {
+  if (!document.fullscreenElement) stereoFullscreen = false;
+  setTimeout(handleResize, 60);
 });
 
 // Register PWA Service Worker

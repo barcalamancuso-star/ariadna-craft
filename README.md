@@ -10,10 +10,12 @@ Juego voxel 3D **100% online** estilo Minecraft para **celular (táctil), PC (si
   - **PC**: `WASD` + mouse (Pointer Lock), `Click izq` picar, `Click der` / `E` poner bloque, teclas `1..9` y botones `<` / `>` / clic directo para cambiar de bloque sin usar rueda del mouse.
   - **WebXR / VR**: botón `VR` nativo cuando el navegador/visor soporta WebXR, más modo **VR Estéreo** fallback para celulares/Cardboard.
 - **Arquitecto Multi-IA en vivo**:
-  - Pedile al asistente del juego (ej. *"haceme una cabaña con luz"* o *"armá un puente sobre el agua"*) y la cascada consulta automáticamente modelos gratuitos configurados en secrets:
-    1. **Groq** (`openai/gpt-oss-120b` con `reasoning_effort: "low"`, `qwen/qwen3.8-27b`, `openai/gpt-oss-20b`)
-    2. **Google Gemini Free** (`gemini-flash-lite-latest`, `gemini-3.1-flash-lite-preview`, `gemini-3-flash-preview`)
-    3. **Mistral** (`codestral-latest`)
+  - Pedile al asistente del juego (ej. *"haceme una cabaña con luz"* o *"armá un puente sobre el agua"*) y la cascada consulta con rotación inteligente entre cuentas y modelos configurados en secrets:
+    1. **Groq** (`GROQ_API_KEY_1`, `GROQ_API_KEY_2` sobre `openai/gpt-oss-120b` con `reasoning_effort: "low"`, `qwen/qwen3.8-27b`, `openai/gpt-oss-20b`)
+    2. **Mistral** (`MISTRAL_API_KEY` sobre `codestral-latest`, `mistral-medium-latest`)
+    3. **Google Gemini (3 cuentas en rotación)** (`GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3` sobre `gemini-4-hydrogen`, `gemini-3-flash-preview`, `gemini-3.5-flash-lite`, `gemma-4-26b-a4b-it`, `gemini-3.8-flash`, `gemini-2.5-flash`, `gemini-3.1-flash-lite-preview`, `gemini-flash-lite-latest`)
+  - Si todos los proveedores reciben `429`/`503`, cae automáticamente en generadores procedimentales determinísticos sin interrumpir la partida.
+  - `/api/health` expone métricas de disponibilidad (`geminiAccounts`, `groqKeys`, `mistral`) sin exponer ninguna credencial.
 - **Persistencia real por sala**: Cloudflare Durable Objects + SQLite almacena los cambios de bloques por sala y retransmite posiciones de avatares, bloques y construcciones IA vía WebSockets Hibernation API.
 
 ## Desarrollo y Pruebas
@@ -29,5 +31,5 @@ npm test
 El repositorio incluye `.github/workflows/deploy.yml` usando `cloudflare/wrangler-action@v3`:
 
 1. Configurar secrets en GitHub Actions: `CLOUDFLARE_API_TOKEN` y `CLOUDFLARE_ACCOUNT_ID`.
-2. Configurar secrets del Worker en Cloudflare: `GROQ_API_KEY_1`, `GROQ_API_KEY_2`, `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `MISTRAL_API_KEY`.
+2. Configurar secrets del Worker en Cloudflare: `GROQ_API_KEY_1`, `GROQ_API_KEY_2`, `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3`, `MISTRAL_API_KEY`.
 3. Hacer `git push origin main`.
