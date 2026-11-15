@@ -1,4 +1,4 @@
-const CACHE_NAME = "ariadna-craft-v2";
+const CACHE_NAME = "ariadna-craft-v3";
 const CORE_ASSETS = [
   "/",
   "/index.html",
@@ -7,6 +7,7 @@ const CORE_ASSETS = [
   "/textures.js",
   "/audio.js",
   "/shared/blocks.js",
+  "/shared/profiles.js",
   "/shared/raycast.js",
   "/shared/mesher.js",
   "/shared/ai_blueprints.js",

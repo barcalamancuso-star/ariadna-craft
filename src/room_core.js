@@ -1,22 +1,21 @@
 import { WORLD_HEIGHT, WORLD_SIZE_X, WORLD_SIZE_Z, blockKey } from "../public/shared/blocks.js";
-
-const AVATAR_COLORS = [
-  "#38bdf8",
-  "#f472b6",
-  "#4ade80",
-  "#facc15",
-  "#fb923c",
-  "#a78bfa",
-  "#2dd4bf",
-  "#f87171",
-];
+import {
+  AVATAR_COLORS,
+  isValidAvatarStyle,
+  normalizeAvatarColor,
+  normalizeAvatarStyle,
+  normalizeUid,
+  sanitizePlayerName,
+} from "../public/shared/profiles.js";
 
 function sanitizeName(raw) {
-  const cleaned = String(raw || "")
-    .replace(/[<>&"'`\u0000-\u001f\u007f]/g, "")
-    .trim()
-    .slice(0, 20);
-  return cleaned || `Viajero-${Math.floor(100 + Math.random() * 899)}`;
+  return sanitizePlayerName(raw) || `Viajero-${Math.floor(100 + Math.random() * 899)}`;
+}
+
+function publicPlayer(meta) {
+  if (!meta) return meta;
+  const { uid: _uid, poseSaved: _poseSaved, ...pub } = meta;
+  return pub;
 }
 
 const MAX_MESSAGE_CHARS = 8192;
@@ -28,12 +27,14 @@ const INIT_EDITS_LIMIT = 12000;
 const SYNC_BATCH_SIZE = 2000;
 const RESET_COOLDOWN_MS = 10000;
 const DROP_LIMIT_BEFORE_KICK = 400;
+const PROFILE_SAVE_INTERVAL_MS = 3000;
 
 // Per-socket token buckets: { rate: tokens/second, burst: max tokens }.
 const RATE_LIMITS = {
   move: { rate: 40, burst: 60 },
   block: { rate: 25, burst: 50 },
   chat: { rate: 1, burst: 4 },
+  profile: { rate: 1, burst: 4 },
   ping: { rate: 5, burst: 10 },
 };
 
@@ -88,6 +89,7 @@ export class RoomCore {
     this.initialized = false;
     this.now = () => Date.now();
     this.buckets = new Map();
+    this.lastProfileSave = new Map();
     this.lastReset = 0;
   }
 
@@ -113,6 +115,20 @@ export class RoomCore {
         kind TEXT NOT NULL,
         text TEXT NOT NULL,
         ts INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS player_profiles (
+        uid TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        color TEXT NOT NULL,
+        style TEXT NOT NULL DEFAULT 'classic',
+        x REAL,
+        y REAL,
+        z REAL,
+        yaw REAL NOT NULL DEFAULT 0,
+        pitch REAL NOT NULL DEFAULT -0.08,
+        held INTEGER NOT NULL DEFAULT 1,
+        visits INTEGER NOT NULL DEFAULT 1,
+        updated_at INTEGER NOT NULL
       );
     `);
 
@@ -210,13 +226,67 @@ export class RoomCore {
     return true;
   }
 
+  getProfile(uid) {
+    if (!uid) return null;
+    this.ensureSchema();
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT uid, name, color, style, x, y, z, yaw, pitch, held, visits FROM player_profiles WHERE uid = ?",
+        uid
+      )
+      .toArray();
+    return rows[0] || null;
+  }
+
+  saveProfileIdentity(uid, name, color, style, incrementVisit = false) {
+    if (!uid) return;
+    this.ensureSchema();
+    const ts = this.now();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO player_profiles (uid, name, color, style, visits, updated_at)
+       VALUES (?, ?, ?, ?, 1, ?)
+       ON CONFLICT(uid) DO UPDATE SET
+         name = excluded.name,
+         color = excluded.color,
+         style = excluded.style,
+         visits = player_profiles.visits + ?,
+         updated_at = excluded.updated_at`,
+      uid,
+      name,
+      color,
+      style,
+      ts,
+      incrementVisit ? 1 : 0
+    );
+  }
+
+  persistPlayerPose(player) {
+    if (!player?.uid || !player.poseSaved) return;
+    this.ensureSchema();
+    const ts = this.now();
+    this.ctx.storage.sql.exec(
+      `UPDATE player_profiles
+       SET x = ?, y = ?, z = ?, yaw = ?, pitch = ?, held = ?, updated_at = ?
+       WHERE uid = ?`,
+      player.x,
+      player.y,
+      player.z,
+      player.yaw,
+      player.pitch,
+      player.held,
+      ts,
+      player.uid
+    );
+    this.lastProfileSave.set(player.id, ts);
+  }
+
   getPlayers(excludeWs = null) {
     const out = [];
     for (const sock of this.ctx.getWebSockets()) {
       if (excludeWs && sock === excludeWs) continue;
       try {
         const meta = sock.deserializeAttachment();
-        if (meta && meta.id) out.push(meta);
+        if (meta && meta.id) out.push(publicPlayer(meta));
       } catch {
         // Ignore stale attachment
       }
@@ -380,21 +450,49 @@ export class RoomCore {
         typeof crypto?.randomUUID === "function"
           ? crypto.randomUUID().slice(0, 8)
           : Math.random().toString(36).slice(2, 10);
-      const name = sanitizeName(url.searchParams.get("name"));
+      const reqUid = normalizeUid(url.searchParams.get("uid"));
+      const existing = reqUid ? this.getProfile(reqUid) : null;
+      const reqName = sanitizePlayerName(url.searchParams.get("name"));
+      const reqColor = normalizeAvatarColor(url.searchParams.get("color"));
+      const rawStyle = url.searchParams.get("style");
+      const reqStyle = isValidAvatarStyle(rawStyle) ? normalizeAvatarStyle(rawStyle) : "";
+
+      const name = reqName || existing?.name || sanitizeName("");
       const room = normalizeRoom(url.searchParams.get("room"));
-      const color = this.pickColor();
+      const color = reqColor || normalizeAvatarColor(existing?.color) || this.pickColor();
+      const style = reqStyle || normalizeAvatarStyle(existing?.style);
+
+      const hasSavedPose = Boolean(
+        existing &&
+          Number.isFinite(existing.x) &&
+          Number.isFinite(existing.y) &&
+          Number.isFinite(existing.z)
+      );
+      const savedPose = hasSavedPose
+        ? {
+            x: clampCoord(existing.x, 0.2, WORLD_SIZE_X - 0.2, 32.5),
+            y: clampCoord(existing.y, 0.2, WORLD_HEIGHT + 10, 18.2),
+            z: clampCoord(existing.z, 0.2, WORLD_SIZE_Z - 0.2, 32.5),
+            yaw: clampCoord(existing.yaw, -1000, 1000, 0),
+            pitch: clampCoord(existing.pitch, -1.58, 1.58, -0.08),
+            held: Number.isInteger(existing.held) ? Math.max(0, Math.min(15, existing.held)) : 1,
+          }
+        : null;
 
       const player = {
         id,
+        uid: reqUid || null,
         name,
         color,
-        x: 32.5,
-        y: 18.2,
-        z: 32.5,
-        yaw: 0,
-        pitch: 0,
-        held: 1,
+        style,
+        x: savedPose ? savedPose.x : 32.5,
+        y: savedPose ? savedPose.y : 18.2,
+        z: savedPose ? savedPose.z : 32.5,
+        yaw: savedPose ? savedPose.yaw : 0,
+        pitch: savedPose ? savedPose.pitch : -0.08,
+        held: savedPose ? savedPose.held : 1,
         vr: false,
+        poseSaved: hasSavedPose,
       };
       server.serializeAttachment(player);
 
@@ -402,7 +500,13 @@ export class RoomCore {
         this.sendInit(server, {
           type: "init",
           selfId: id,
+          selfUid: reqUid || null,
+          selfName: name,
           selfColor: color,
+          selfStyle: style,
+          selfState: savedPose,
+          returning: Boolean(existing),
+          visits: existing ? Number(existing.visits || 1) + 1 : 1,
           room,
           seed: this.getSeed(),
           players: this.getPlayers(server),
@@ -417,7 +521,11 @@ export class RoomCore {
         return new Response("Init failed", { status: 500 });
       }
 
-      this.broadcast({ type: "player_join", player }, server);
+      if (reqUid) {
+        this.saveProfileIdentity(reqUid, name, color, style, Boolean(existing));
+      }
+
+      this.broadcast({ type: "player_join", player: publicPlayer(player) }, server);
 
       return this.makeUpgradeResponse(client);
     }
@@ -472,9 +580,33 @@ export class RoomCore {
           pitch: clampCoord(data.pitch, -1.58, 1.58, player.pitch),
           held: Number.isInteger(data.held) ? Math.max(0, Math.min(15, data.held)) : player.held,
           vr: typeof data.vr === "boolean" ? data.vr : Boolean(player.vr),
+          poseSaved: true,
         };
         ws.serializeAttachment(updated);
-        this.broadcast({ type: "player_move", player: updated }, ws);
+        this.broadcast({ type: "player_move", player: publicPlayer(updated) }, ws);
+        if (updated.uid && this.now() - (this.lastProfileSave.get(updated.id) || 0) >= PROFILE_SAVE_INTERVAL_MS) {
+          this.persistPlayerPose(updated);
+        }
+        break;
+      }
+
+      case "profile": {
+        const nextName = sanitizePlayerName(data.name) || player.name;
+        const nextColor = normalizeAvatarColor(data.color) || player.color;
+        const nextStyle = isValidAvatarStyle(data.style)
+          ? normalizeAvatarStyle(data.style)
+          : normalizeAvatarStyle(player.style);
+        const updated = {
+          ...player,
+          name: nextName,
+          color: nextColor,
+          style: nextStyle,
+        };
+        ws.serializeAttachment(updated);
+        if (updated.uid) {
+          this.saveProfileIdentity(updated.uid, nextName, nextColor, nextStyle, false);
+        }
+        this.broadcast({ type: "player_profile", player: publicPlayer(updated) });
         break;
       }
 
@@ -515,6 +647,17 @@ export class RoomCore {
           String(newSeed)
         );
         this.ctx.storage.sql.exec("DELETE FROM block_edits");
+        this.ctx.storage.sql.exec(
+          "UPDATE player_profiles SET x = NULL, y = NULL, z = NULL, yaw = 0, pitch = -0.08"
+        );
+        for (const sock of this.ctx.getWebSockets()) {
+          try {
+            const meta = sock.deserializeAttachment();
+            if (meta?.id) sock.serializeAttachment({ ...meta, poseSaved: false });
+          } catch {
+            // ignore
+          }
+        }
         const notice = this.appendChat("Sistema", "system", `${player.name} generó un mundo nuevo (#${newSeed}).`);
         this.broadcast({ type: "world_reset", seed: newSeed, chat: notice });
         break;
@@ -522,16 +665,24 @@ export class RoomCore {
     }
   }
 
-  async webSocketClose(ws, code, reason) {
+  cleanupSocket(ws) {
     try {
       const player = ws.deserializeAttachment();
       if (player?.id) {
+        if (player.uid && player.poseSaved) {
+          this.persistPlayerPose(player);
+        }
+        this.lastProfileSave.delete(player.id);
         this.buckets.delete(player.id);
         this.broadcast({ type: "player_leave", id: player.id }, ws);
       }
     } catch {
       // Ignore stale attachment
     }
+  }
+
+  async webSocketClose(ws, code, reason) {
+    this.cleanupSocket(ws);
     try {
       ws.close(validCloseCode(code), String(reason || "Closed").slice(0, 100));
     } catch {
@@ -540,14 +691,6 @@ export class RoomCore {
   }
 
   async webSocketError(ws) {
-    try {
-      const player = ws.deserializeAttachment();
-      if (player?.id) {
-        this.buckets.delete(player.id);
-        this.broadcast({ type: "player_leave", id: player.id }, ws);
-      }
-    } catch {
-      // Ignore
-    }
+    this.cleanupSocket(ws);
   }
 }

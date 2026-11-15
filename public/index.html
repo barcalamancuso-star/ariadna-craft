@@ -30,8 +30,10 @@
     <!-- Top compact bar (zero scroll) -->
     <header id="hud-top">
       <div class="hud-group">
-        <button class="pill pill-brand" id="btn-room" title="Cambiar sala o nombre">
+        <button class="pill pill-brand" id="btn-room" title="Cambiar personaje, nombre o sala">
           <span class="dot connecting" id="ws-dot"></span>
+          <span id="player-pill-badge" class="player-pill-badge">🧑</span>
+          <span class="pill-sep">·</span>
           <span id="room-label">principal</span>
           <span id="online-count">1</span>
         </button>
@@ -137,25 +139,64 @@
       </div>
     </section>
 
+    <!-- Modal: Bienvenida / Elección de Nombre y Personaje -->
+    <section class="modal hidden" id="modal-welcome" role="dialog" aria-modal="true" aria-label="Elegí tu personaje">
+      <div class="card card-welcome">
+        <div class="card-head">
+          <strong>🧱 Elegí tu nombre y personaje</strong>
+        </div>
+        <p class="status-line">Tu nombre, aspecto y ubicación quedan guardados para cuando vuelvas.</p>
+        <form id="welcome-form" class="stack">
+          <div class="avatar-preview-row">
+            <div id="welcome-avatar-preview" class="avatar-preview" aria-hidden="true">🧑</div>
+            <label class="field flex-1">
+              <span>Tu nombre (visible para todos)</span>
+              <input id="welcome-name" type="text" maxlength="20" placeholder="Ej: Milo, Sofi, Cris..." autocomplete="nickname" required />
+            </label>
+          </div>
+          <div class="field">
+            <span>Color</span>
+            <div id="welcome-colors" class="color-row" role="radiogroup" aria-label="Color de personaje"></div>
+          </div>
+          <div class="field">
+            <span>Personaje</span>
+            <div id="welcome-styles" class="style-row" role="radiogroup" aria-label="Estilo de personaje"></div>
+          </div>
+          <div class="row-inline">
+            <button type="submit" class="btn-primary flex-1">Entrar a Jugar 🚀</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
     <!-- Modal: Sala / Jugador / Mundo -->
-    <section class="modal hidden" id="modal-room" role="dialog" aria-modal="true" aria-label="Sala Multiplayer">
+    <section class="modal hidden" id="modal-room" role="dialog" aria-modal="true" aria-label="Jugador y Sala">
       <div class="card">
         <div class="card-head">
-          <strong>🌐 Sala Multiplayer</strong>
+          <strong>👤 Tu Personaje &amp; Sala</strong>
           <button type="button" class="close-btn" data-close="modal-room" aria-label="Cerrar">✕</button>
         </div>
         <form id="room-form" class="stack">
-          <label class="field">
-            <span>Tu nombre</span>
-            <input id="input-name" type="text" maxlength="20" placeholder="Cristian" />
-          </label>
+          <div class="avatar-preview-row">
+            <div id="room-avatar-preview" class="avatar-preview" aria-hidden="true">🧑</div>
+            <label class="field flex-1">
+              <span>Tu nombre</span>
+              <input id="input-name" type="text" maxlength="20" placeholder="Elegí tu nombre" required />
+            </label>
+          </div>
+          <div class="field">
+            <span>Color y personaje</span>
+            <div id="room-colors" class="color-row" role="radiogroup" aria-label="Color de personaje"></div>
+            <div id="room-styles" class="style-row" role="radiogroup" aria-label="Estilo de personaje"></div>
+          </div>
           <label class="field">
             <span>Código de sala</span>
             <input id="input-room" type="text" maxlength="28" placeholder="principal" />
           </label>
           <div class="row-inline">
-            <button type="submit" class="btn-primary">Conectar a Sala</button>
-            <button type="button" class="btn-secondary" id="btn-touch-toggle">🎮 Controles Táctiles</button>
+            <button type="submit" class="btn-primary">Guardar y Entrar</button>
+            <button type="button" class="btn-secondary" id="btn-new-user" title="Crear otro perfil en este navegador">👤 Nuevo jugador</button>
+            <button type="button" class="btn-secondary" id="btn-touch-toggle">🎮 Táctiles</button>
             <button type="button" class="btn-danger" id="btn-reset-world">🌍 Nuevo Mundo</button>
           </div>
         </form>

@@ -21,6 +21,7 @@ function createMockSqlStorage() {
   const meta = new Map();
   const edits = new Map();
   const chat = [];
+  const profiles = new Map();
   let chatAutoId = 1;
 
   return {
@@ -69,6 +70,45 @@ function createMockSqlStorage() {
       }
       if (q.startsWith("DELETE FROM chat_log")) {
         while (chat.length > 40) chat.shift();
+        return { toArray: () => [] };
+      }
+      if (q.startsWith("SELECT uid, name, color, style")) {
+        const row = profiles.get(params[0]);
+        return { toArray: () => (row ? [{ ...row }] : []) };
+      }
+      if (q.startsWith("INSERT INTO player_profiles")) {
+        const [uid, name, color, style, updated_at, inc] = params;
+        const prev = profiles.get(uid);
+        profiles.set(uid, {
+          uid,
+          name,
+          color,
+          style,
+          x: prev ? prev.x : null,
+          y: prev ? prev.y : null,
+          z: prev ? prev.z : null,
+          yaw: prev ? prev.yaw : 0,
+          pitch: prev ? prev.pitch : -0.08,
+          held: prev ? prev.held : 1,
+          visits: prev ? prev.visits + Number(inc || 0) : 1,
+          updated_at,
+        });
+        return { toArray: () => [] };
+      }
+      if (q.startsWith("UPDATE player_profiles SET x = NULL")) {
+        for (const row of profiles.values()) {
+          row.x = null;
+          row.y = null;
+          row.z = null;
+          row.yaw = 0;
+          row.pitch = -0.08;
+        }
+        return { toArray: () => [] };
+      }
+      if (q.startsWith("UPDATE player_profiles SET x = ?")) {
+        const [x, y, z, yaw, pitch, held, updated_at, uid] = params;
+        const row = profiles.get(uid);
+        if (row) Object.assign(row, { x, y, z, yaw, pitch, held, updated_at });
         return { toArray: () => [] };
       }
       throw new Error(`Unexpected SQL in test: ${q}`);

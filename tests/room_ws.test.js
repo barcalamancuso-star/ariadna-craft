@@ -7,11 +7,13 @@ function createSql() {
   const meta = new Map();
   const edits = new Map();
   const chat = [];
+  const profiles = new Map();
   let chatId = 1;
   const none = { toArray: () => [] };
   return {
     edits,
     chat,
+    profiles,
     exec(query, ...params) {
       const q = query.replace(/\s+/g, " ").trim();
       if (q.startsWith("CREATE TABLE")) return none;
@@ -58,6 +60,45 @@ function createSql() {
       }
       if (q.startsWith("DELETE FROM chat_log")) {
         while (chat.length > 40) chat.shift();
+        return none;
+      }
+      if (q.startsWith("SELECT uid, name, color, style")) {
+        const row = profiles.get(params[0]);
+        return { toArray: () => (row ? [{ ...row }] : []) };
+      }
+      if (q.startsWith("INSERT INTO player_profiles")) {
+        const [uid, name, color, style, updated_at, inc] = params;
+        const prev = profiles.get(uid);
+        profiles.set(uid, {
+          uid,
+          name,
+          color,
+          style,
+          x: prev ? prev.x : null,
+          y: prev ? prev.y : null,
+          z: prev ? prev.z : null,
+          yaw: prev ? prev.yaw : 0,
+          pitch: prev ? prev.pitch : -0.08,
+          held: prev ? prev.held : 1,
+          visits: prev ? prev.visits + Number(inc || 0) : 1,
+          updated_at,
+        });
+        return none;
+      }
+      if (q.startsWith("UPDATE player_profiles SET x = NULL")) {
+        for (const row of profiles.values()) {
+          row.x = null;
+          row.y = null;
+          row.z = null;
+          row.yaw = 0;
+          row.pitch = -0.08;
+        }
+        return none;
+      }
+      if (q.startsWith("UPDATE player_profiles SET x = ?")) {
+        const [x, y, z, yaw, pitch, held, updated_at, uid] = params;
+        const row = profiles.get(uid);
+        if (row) Object.assign(row, { x, y, z, yaw, pitch, held, updated_at });
         return none;
       }
       throw new Error(`Unexpected SQL: ${q}`);
@@ -562,4 +603,83 @@ test("init: very large edit sets are split so no single frame carries everything
   const synced = a.sent.slice(1).filter((m) => m.type === "ai_build" && m.provider === "sync");
   assert.equal(synced.reduce((n, m) => n + m.blocks.length, 0), 18000);
   assert.ok(synced.every((m) => JSON.stringify(m).length < 200000));
+});
+
+// ---------- persistent user / character profiles ----------
+test("profile: uid persists character identity, appearance and last pose across reconnect & hibernation", async () => {
+  const ctx = createCtx();
+  const core1 = makeCore(ctx);
+
+  const milo1 = await join(core1, ctx, "room=principal&uid=milo_uid_01&name=Milo&color=%234ade80&style=crown");
+  assert.equal(milo1.sent[0].selfName, "Milo");
+  assert.equal(milo1.sent[0].selfColor, "#4ade80");
+  assert.equal(milo1.sent[0].selfStyle, "crown");
+  assert.equal(milo1.sent[0].returning, false);
+  assert.equal(milo1.sent[0].selfState, null, "brand new user lets client compute terrain spawn");
+
+  const sofi = await join(core1, ctx, "room=principal&uid=sofi_uid_02&name=Sofi&color=%23f472b6&style=cap");
+  // Secret uid must NEVER be leaked to other players or /internal/state
+  assert.equal(sofi.sent[0].players[0].uid, undefined);
+  assert.equal(sofi.sent[0].players[0].name, "Milo");
+  assert.equal(sofi.sent[0].players[0].style, "crown");
+
+  const stateRes = await core1.fetch(new Request("https://do.internal/internal/state"));
+  const stateJson = await stateRes.json();
+  assert.equal(stateJson.players[0].uid, undefined);
+
+  // Milo moves and closes cleanly (should flush exact pose even without 3s interval)
+  await send(core1, milo1, { type: "move", x: 18.5, y: 24.25, z: 41.75, yaw: 1.25, pitch: -0.3, held: 7 });
+  await core1.webSocketClose(milo1, 1000, "bye");
+  ctx.drop(milo1);
+
+  // Fresh RoomCore (simulates Durable Object hibernation wake-up)
+  const core2 = makeCore(ctx);
+  // Returning user omits name/color/style -> restored automatically from DB!
+  const milo2 = await join(core2, ctx, "room=principal&uid=milo_uid_01");
+  assert.equal(milo2.sent[0].returning, true);
+  assert.equal(milo2.sent[0].visits, 2);
+  assert.equal(milo2.sent[0].selfName, "Milo");
+  assert.equal(milo2.sent[0].selfColor, "#4ade80");
+  assert.equal(milo2.sent[0].selfStyle, "crown");
+  assert.deepEqual(milo2.sent[0].selfState, {
+    x: 18.5,
+    y: 24.25,
+    z: 41.75,
+    yaw: 1.25,
+    pitch: -0.3,
+    held: 7,
+  });
+});
+
+test("profile: live profile message updates identity cleanly and reset_world clears saved coords only", async () => {
+  const ctx = createCtx();
+  const core = makeCore(ctx);
+  const a = await join(core, ctx, "room=p&uid=user_alpha_9&name=Lucas&color=%2338bdf8&style=classic");
+  const b = await join(core, ctx, "room=p&uid=user_beta_9&name=Elena&color=%23fb923c&style=visor");
+
+  await send(core, a, { type: "move", x: 12.2, y: 21.5, z: 14.8, yaw: 0.4, pitch: 0.1, held: 4 });
+  core.advance(3500);
+  await send(core, a, { type: "move", x: 15.6, y: 22.0, z: 19.1, yaw: 0.9, pitch: -0.2, held: 5 });
+
+  await send(core, a, { type: "profile", name: "<b>Lucho</b>", color: "#a78bfa", style: "robot" });
+  const profBroadcastA = a.sent.at(-1);
+  const profBroadcastB = b.sent.at(-1);
+  assert.equal(profBroadcastA.type, "player_profile");
+  assert.equal(profBroadcastA.player.name, "bLucho/b");
+  assert.equal(profBroadcastA.player.color, "#a78bfa");
+  assert.equal(profBroadcastA.player.style, "robot");
+  assert.equal(profBroadcastA.player.uid, undefined);
+  assert.deepEqual(profBroadcastA, profBroadcastB);
+
+  // reset_world resets coordinates while keeping character look/name intact
+  await send(core, a, { type: "reset_world" });
+  await core.webSocketClose(a, 1000, "rejoin");
+  ctx.drop(a);
+
+  const a2 = await join(core, ctx, "room=p&uid=user_alpha_9");
+  assert.equal(a2.sent[0].returning, true);
+  assert.equal(a2.sent[0].selfName, "bLucho/b");
+  assert.equal(a2.sent[0].selfColor, "#a78bfa");
+  assert.equal(a2.sent[0].selfStyle, "robot");
+  assert.equal(a2.sent[0].selfState, null, "world_reset must clear saved coordinates safely");
 });
