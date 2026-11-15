@@ -244,12 +244,12 @@ test("runAiArchitect sends reasoning_effort=low only for openai/gpt-oss models",
   const mistralCall = seenPayloads.find((p) => p.body.model === "codestral-latest");
   assert.ok(gptOssCall, "Expected gpt-oss-120b to be tried first");
   assert.equal(gptOssCall.body.reasoning_effort, "low");
-  assert.equal(gptOssCall.body.max_tokens, 2000);
+  assert.equal(gptOssCall.body.max_tokens, 3200);
   assert.ok(qwenCall, "Expected qwen3.8-27b to be tried after gpt-oss-120b 429");
   assert.equal(qwenCall.body.reasoning_effort, undefined);
   assert.ok(mistralCall, "Expected codestral-latest fallback");
   assert.equal(mistralCall.body.reasoning_effort, undefined);
-  assert.equal(mistralCall.body.max_tokens, 2000);
+  assert.equal(mistralCall.body.max_tokens, 3200);
 });
 
 test("buildProviderPlan rotates 3 Gemini accounts across all healthy models and handles 503/429 + thought parts", async () => {
@@ -264,7 +264,7 @@ test("buildProviderPlan rotates 3 Gemini accounts across all healthy models and 
 
   const geminiPlan = buildProviderPlan(fullEnv, "gemini");
   assert.equal(geminiPlan[0].provider, "gemini");
-  assert.equal(geminiPlan[0].model, "gemini-4-hydrogen");
+  assert.equal(geminiPlan[0].model, "gemini-3.5-flash-lite");
   assert.equal(geminiPlan[0].keySlot, 1);
   assert.equal(geminiPlan[1].keySlot, 2);
   assert.equal(geminiPlan[2].keySlot, 3);
@@ -294,13 +294,6 @@ test("buildProviderPlan rotates 3 Gemini accounts across all healthy models and 
   const triedUrls = [];
   const mockGeminiFetch = async (url) => {
     triedUrls.push(url);
-    if (
-      url.includes("gemini-4-hydrogen") ||
-      url.includes("gemini-3-flash-preview") ||
-      url.includes("gemini-3.5-flash-lite")
-    ) {
-      return new Response("overloaded", { status: 503 });
-    }
     if (url.includes("gemma-4-26b-a4b-it")) {
       return new Response(
         JSON.stringify({
@@ -326,7 +319,7 @@ test("buildProviderPlan rotates 3 Gemini accounts across all healthy models and 
         { status: 200 }
       );
     }
-    return new Response("rate limit", { status: 429 });
+    return new Response("overloaded", { status: 503 });
   };
 
   const res = await runAiArchitect({
@@ -343,7 +336,7 @@ test("buildProviderPlan rotates 3 Gemini accounts across all healthy models and 
   assert.equal(res.reply, "Observatorio listo");
   assert.equal(res.blocks.length, 1);
   assert.equal(res.blocks[0].t, BLOCK_IDS.GLASS);
-  assert.equal(triedUrls.length, 4);
+  assert.equal(triedUrls.length, 8);
 });
 
 const fakeUpgrade = (client) => ({ status: 101, webSocket: client });

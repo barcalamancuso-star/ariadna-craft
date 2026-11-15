@@ -17,15 +17,34 @@ export const MISTRAL_MODELS = [
 ];
 
 export const GEMINI_MODELS = [
-  "gemini-4-hydrogen",
-  "gemini-3-flash-preview",
   "gemini-3.5-flash-lite",
-  "gemma-4-26b-a4b-it",
-  "gemini-3.8-flash",
-  "gemini-2.5-flash",
+  "gemini-3-flash-preview",
   "gemini-3.1-flash-lite-preview",
   "gemini-flash-lite-latest",
+  "gemini-2.5-flash",
+  "gemini-4-hydrogen",
+  "gemini-3.8-flash",
+  "gemma-4-26b-a4b-it",
 ];
+
+async function fetchWithTimeout(fetchImpl, url, init, timeoutMs = 12000) {
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = controller
+    ? setTimeout(() => {
+        try {
+          controller.abort();
+        } catch {}
+      }, timeoutMs)
+    : null;
+  if (timer && typeof timer.unref === "function") {
+    timer.unref();
+  }
+  try {
+    return await fetchImpl(url, controller ? { ...init, signal: controller.signal } : init);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function wantsConstruction(prompt) {
   const low = String(prompt || "").toLowerCase();
@@ -42,13 +61,13 @@ async function callOpenAiCompatible(endpoint, apiKey, model, userPrompt, fetchIm
       { role: "user", content: userPrompt },
     ],
     temperature: 0.35,
-    max_tokens: 2000,
+    max_tokens: 3200,
   };
   if (model.startsWith("openai/gpt-oss")) {
     payload.reasoning_effort = "low";
   }
 
-  const res = await fetchImpl(endpoint, {
+  const res = await fetchWithTimeout(fetchImpl, endpoint, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -75,7 +94,7 @@ async function callGemini(apiKey, model, userPrompt, fetchImpl = fetch) {
     model
   )}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
-  const res = await fetchImpl(url, {
+  const res = await fetchWithTimeout(fetchImpl, url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -86,7 +105,7 @@ async function callGemini(apiKey, model, userPrompt, fetchImpl = fetch) {
       contents: [{ role: "user", parts: [{ text: userPrompt }] }],
       generationConfig: {
         temperature: 0.35,
-        maxOutputTokens: 2400,
+        maxOutputTokens: 4096,
         responseMimeType: "application/json",
       },
     }),

@@ -169,11 +169,43 @@ export function extractJsonObject(rawText) {
       try {
         return JSON.parse(cleaned.slice(start, end + 1));
       } catch {
-        return null;
+        // Fall through to salvage
       }
     }
-    return null;
   }
+
+  // Salvage fallback for truncated streaming JSON containing "blocks"
+  if (/["']blocks["']/.test(cleaned)) {
+    let reply = "";
+    const replyMatch = cleaned.match(/["']reply["']\s*:\s*"((?:[^"\\]|\\.)*)"/i);
+    if (replyMatch) {
+      try {
+        reply = JSON.parse(`"${replyMatch[1]}"`);
+      } catch {
+        reply = replyMatch[1];
+      }
+    }
+
+    const blocks = [];
+    const blockRegex = /\{[^{}]*(?:dx|dy|dz|t|type|block)[^{}]*\}/gi;
+    let m;
+    while ((m = blockRegex.exec(cleaned)) !== null) {
+      try {
+        const item = JSON.parse(m[0]);
+        if (item && typeof item === "object") {
+          blocks.push(item);
+        }
+      } catch {
+        // Ignore unparseable fragment
+      }
+    }
+
+    if (blocks.length > 0 || reply) {
+      return { reply: reply || "Construcción lista.", blocks };
+    }
+  }
+
+  return null;
 }
 
 export function sanitizeBlueprint(parsed, anchor, maxBlocks = 240) {
@@ -624,19 +656,17 @@ export const ARCHITECT_SYSTEM_PROMPT = `Eres Ariadna, arquitecta voxel 3D suprem
 Tu misión es diseñar estructuras arquitectónicas creativas, estéticas y bien proporcionadas cuando el jugador te lo pida, o conversar de forma amigable e inteligente.
 
 FORMATO DE RESPUESTA:
-Debes responder SIEMPRE con un único objeto JSON válido (sin formato markdown, sin comillas invertidas, sin texto antes ni después), con este esquema exacto:
-{"reply": "mensaje breve y expresivo en español rioplatense", "blocks": [{"dx": 0, "dy": 0, "dz": 0, "t": "stone"}]}
+Debes responder SIEMPRE con un único objeto JSON válido, MINIFICADO en una sola línea (SIN saltos de línea ni indentación dentro del JSON), con este esquema exacto:
+{"reply":"mensaje breve y expresivo en español rioplatense","blocks":[{"dx":0,"dy":0,"dz":0,"t":"stone"}]}
 
 REGLAS DE CONSTRUCCIÓN:
 1. SI EL USUARIO NO PIDE CONSTRUIR (solo saluda, conversa o pregunta):
-   - Devuelve "blocks": [].
-   - En "reply", responde con calidez e ingenio rioplatense invitándolo a construir algo épico (ej: un castillo, faro, puente, pirámide, portal, árbol, observatorio, plaza o cabaña).
+   - Devuelve "blocks":[] y en "reply" responde amable e ingeniosa invitando a construir algo genial.
 
 2. SI EL USUARIO PIDE CONSTRUIR O NOMBRA UNA ESTRUCTURA:
-   - Coordenadas relativas: dx en [-8, 8], dy en [0, 14], dz en [-8, 8].
-   - dy = 0 es el nivel de superficie o suelo del punto de anclaje. Nunca uses dy < 0 excepto para excavar cimientos mínimos.
-   - Cantidad de bloques: entre 12 y 180 bloques bien aprovechados (máximo absoluto 240).
-   - Estilo: simetría, ventanas de vidrio (glass), faroles o linternas (glow), remates con oro o diamante, y puertas abiertas para poder entrar.
+   - MINIFICADO Y COMPACTO: genera entre 20 y 65 bloques compactos y significativos para que la respuesta sea rápida (~500 tokens, 1.5-3s de latencia).
+   - Coordenadas relativas: dx en [-8, 8], dy en [0, 14], dz en [-8, 8]. dy=0 es el nivel de superficie del suelo.
+   - Estilo: simetría, ventanas de vidrio (glass), faroles o linternas (glow), remates con oro o diamante, y puertas abiertas.
    - Tipos de bloques válidos en "t":
      "air", "grass", "dirt", "stone", "wood", "planks", "leaves", "sand", "water", "brick", "glass", "glow", "diamond", "gold", "obsidian", "portal".
 
@@ -651,7 +681,7 @@ REGLAS DE CONSTRUCCIÓN:
    - Fuente / Plaza (stone paved square, wooden lampposts with glow, central water basin and geyser)
    - Casa / Cabaña (stone foundation, wooden walls, glass windows, pitched brick roof, warm lantern)
 
-Responde SIEMPRE únicamente con el objeto JSON parseable.`;
+Responde SIEMPRE únicamente con el JSON minificado en una sola línea sin texto extra ni markdown.`;
 
 // Backward-compatible alias
 export const AI_ARCHITECT_SYSTEM_PROMPT = ARCHITECT_SYSTEM_PROMPT;

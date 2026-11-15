@@ -116,6 +116,45 @@ test("extractJsonObject extracts pure JSON, fenced markdown, and conversational 
   assert.equal(extractJsonObject(undefined), null);
 });
 
+test("extractJsonObject cleanly salvages truncated JSON arrays from streaming responses", () => {
+  // Truncated single-line response cut off mid-block
+  const truncatedSingleLine =
+    '{"reply":"Castillo iniciado","blocks":[{"dx":0,"dy":0,"dz":0,"t":"stone"},{"dx":1,"dy":0,"dz":0,"t":"brick"},{"dx":2,"dy":0,"dz":0,"t":"stone"},{"dx":3,"dy":';
+  const salvaged1 = extractJsonObject(truncatedSingleLine);
+  assert.ok(salvaged1 !== null, "Expected truncated JSON to be salvaged");
+  assert.equal(salvaged1.reply, "Castillo iniciado");
+  assert.equal(salvaged1.blocks.length, 3);
+  assert.equal(salvaged1.blocks[0].t, "stone");
+  assert.equal(salvaged1.blocks[1].t, "brick");
+  assert.equal(salvaged1.blocks[2].t, "stone");
+
+  // Truncated multi-line response cut off inside blocks array
+  const truncatedMultiLine = [
+    "```json",
+    "{",
+    '  "reply": "Faro luminoso",',
+    '  "blocks": [',
+    '    { "dx": 0, "dy": 0, "dz": 0, "t": "stone" },',
+    '    { "dx": 0, "dy": 1, "dz": 0, "t": "brick" },',
+    '    { "dx": 0, "dy": 2',
+  ].join("\n");
+  const salvaged2 = extractJsonObject(truncatedMultiLine);
+  assert.ok(salvaged2 !== null);
+  assert.equal(salvaged2.reply, "Faro luminoso");
+  assert.equal(salvaged2.blocks.length, 2);
+  assert.equal(salvaged2.blocks[1].t, "brick");
+
+  // Truncated without reply field
+  const noReplyTruncated = '{"blocks":[{"dx":0,"dy":0,"dz":0,"t":"planks"},{"dx":1,"dy":0,"dz":0,"t":"glow"}';
+  const salvaged3 = extractJsonObject(noReplyTruncated);
+  assert.ok(salvaged3 !== null);
+  assert.equal(salvaged3.blocks.length, 2);
+  assert.ok(salvaged3.reply.length > 0);
+
+  // Truncated without any complete block objects returns null
+  assert.equal(extractJsonObject('{"blocks": ['), null);
+});
+
 test("sanitizeBlueprint clamps bounds, protects bedrock (y >= 1), deduplicates, and limits block counts", () => {
   const anchor = { x: 32, y: 18, z: 32 };
 
